@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +44,10 @@ INHERITED_ENV_KEYS = {
     "LC_ALL", "LC_CTYPE", "TERM", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
     "SESSIONNAME", "PLAYWRIGHT_BROWSERS_PATH", "DOCKER_HOST", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "VIRTUAL_ENV",
+    # Needed so `git push` can use the user's existing SSH agent / credential manager.
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GCM_CREDENTIAL_STORE",
 }
+REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,50}$")
 
 ALLOWED_PYTHON_MODULES = {"pytest", "bandit", "pip_audit", "flask", "compileall", "pip"}
 PIP_READ_ONLY = {"show", "list", "freeze", "--version"}
@@ -94,6 +98,11 @@ class CommandPolicy:
     app_modules: set[str] = field(default_factory=set)
     app_scripts: list[str] = field(default_factory=list)
     allow_pyinstaller: bool = False
+    # Pushing is off unless the project enables it; then only `push_branch` to `push_remote`.
+    allow_push: bool = False
+    push_remote: str = "origin"
+    push_branch: str = ""
+    protected_branches: set[str] = field(default_factory=lambda: {"main", "master"})
 
     def _within_roots(self, path: Path) -> bool:
         resolved = path.resolve()
@@ -163,6 +172,9 @@ class CommandPolicy:
         if i >= len(args):
             return
         sub, rest = args[i], args[i + 1 :]
+        if sub in {"push", "remote", "ls-remote"}:
+            self._validate_remote_ops(sub, rest)
+            return
         if sub not in GIT_ALLOWED_SUBCOMMANDS:
             raise CommandRejected(f"git {sub} is not permitted")
         # Values following -m (commit messages) are not flags; skip them.
@@ -195,6 +207,42 @@ class CommandPolicy:
             for a in rest:
                 if Path(a).name.lower() in {".env", ".env.local", "credentials.json", "id_rsa"}:
                     raise CommandRejected(f"refusing to stage secret file {a}")
+
+    def _validate_remote_ops(self, sub: str, rest: list[str]) -> None:
+        """Remote access: read-only remote inspection, and pushing the development branch when enabled."""
+        from config import valid_remote_url
+
+        if sub == "remote":
+            if rest in (["-v"], []):
+                return
+            if len(rest) == 2 and rest[0] == "get-url" and REMOTE_NAME_RE.match(rest[1]):
+                return
+            if len(rest) == 3 and rest[0] in {"add", "set-url"} and self.allow_push:
+                if rest[1] != self.push_remote:
+                    raise CommandRejected(f"only the configured remote {self.push_remote!r} may be added or changed")
+                if not valid_remote_url(rest[2]):
+                    raise CommandRejected("remote URL must be an https:// or git@ / ssh:// repository URL")
+                return
+            raise CommandRejected("only 'git remote -v/get-url' (and add/set-url of the configured remote when pushing is enabled) are permitted")
+        if sub == "ls-remote":
+            if len(rest) == 2 and rest[0] == "--heads" and rest[1] == self.push_remote:
+                return
+            raise CommandRejected("only 'git ls-remote --heads <configured remote>' is permitted")
+        # push
+        if not self.allow_push:
+            raise CommandRejected("git push is disabled for this project (enable git_push_enabled to allow it)")
+        args = [a for a in rest if a not in {"-u", "--set-upstream"}]
+        if any(a.startswith("-") for a in args):
+            raise CommandRejected(f"git push flags {[a for a in args if a.startswith('-')]} are not permitted (no force, no delete)")
+        if len(args) != 2:
+            raise CommandRejected("git push must name exactly one remote and one branch")
+        remote, branch = args
+        if remote != self.push_remote:
+            raise CommandRejected(f"git push is only permitted to the configured remote {self.push_remote!r}")
+        if any(c in branch for c in ":+*^~") or branch != self.push_branch:
+            raise CommandRejected(f"only the development branch {self.push_branch!r} may be pushed")
+        if branch in self.protected_branches:
+            raise CommandRejected(f"pushing protected branch {branch!r} is not permitted")
 
     def _validate_python(self, args: list[str], cwd: Path) -> None:
         if not args:

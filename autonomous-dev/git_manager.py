@@ -201,8 +201,45 @@ class GitManager:
         sha = result.stdout.strip().splitlines()
         return sha[0] if sha else None
 
+    # --------------------------------------------------------------- remotes
+    def remote_url(self, path: Path, remote: str) -> str | None:
+        result = self.run(["remote", "get-url", remote], path, check=False)
+        return result.stdout.strip() if result.ok else None
+
+    def ensure_remote(self, path: Path, remote: str, url: str) -> str:
+        """Make sure ``remote`` exists (adding it from ``url`` if needed). Returns a short status message."""
+        current = self.remote_url(path, remote)
+        if current:
+            if url and current != url:
+                return f"remote {remote!r} already points to {current}; left unchanged"
+            return f"remote {remote!r}: {current}"
+        if not url:
+            raise GitError(f"remote {remote!r} does not exist and no repository URL is configured")
+        self.run(["remote", "add", remote, url], path)
+        return f"added remote {remote!r} -> {url}"
+
+    def check_remote(self, path: Path, remote: str) -> tuple[bool, str]:
+        """Read-only connectivity/credentials check (git ls-remote)."""
+        result = self.executor.run([self.git, "ls-remote", "--heads", remote], path, timeout=60, env_extra={"GIT_TERMINAL_PROMPT": "0"})
+        return result.ok, (result.summary(600) or "ok")
+
+    def push(self, path: Path, remote: str, branch: str) -> tuple[bool, str]:
+        """Push the development branch. Never forces; a rejected push is reported, not overridden."""
+        result = self.executor.run(
+            [self.git, "push", "--set-upstream", remote, branch], path, timeout=300,
+            env_extra={"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"},
+        )
+        if result.ok:
+            return True, f"pushed {branch} to {remote}"
+        text = result.summary(800)
+        if "rejected" in text or "non-fast-forward" in text:
+            text = "push rejected (the remote branch has commits this workspace does not have); resolve it manually - the controller never force-pushes. " + text
+        elif "Authentication" in text or "could not read Username" in text or "Permission denied" in text:
+            text = "authentication failed: log in with your git credential manager or SSH key so `git push` works without a prompt. " + text
+        return False, text
+
     # -------------------------------------------------------------- commits
-    def commit_changes(self, path: Path, message: str, task_id: int | None, protected_branches: set[str]) -> str | None:
+    def commit_changes(self, path: Path, message: str, task_id: int | None, protected_branches: set[str], body: list[str] | None = None) -> str | None:
         """Stage every non-secret change in the workspace and commit it. Returns the new commit sha."""
         branch = self.current_branch(path)
         if branch is None and self.has_commits(path):
@@ -214,7 +251,11 @@ class GitManager:
             return None
         for start in range(0, len(changes), 50):
             self.run(["add", "--", *changes[start : start + 50]], path)
-        args = ["-c", f"user.name={self.author_name}", "-c", f"user.email={self.author_email}", "commit", "-m", message]
+        args = ["-c", f"user.name={self.author_name}", "-c", f"user.email={self.author_email}", "commit", "-m", message.replace("\n", " ")[:200]]
+        for paragraph in body or []:
+            text = " ".join(paragraph.split())[:2000]  # one paragraph per -m; arguments may not contain newlines
+            if text:
+                args += ["-m", text]
         if task_id is not None:
             args += ["-m", f"{TASK_TRAILER}: {task_id}"]
         result = self.executor.run([self.git, *args], path, timeout=120)

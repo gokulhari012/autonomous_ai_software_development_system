@@ -150,7 +150,7 @@ def cmd_run(args) -> int:
         print("Interrupted. State is saved; run again to resume.", file=sys.stderr)
         return 130
     print(json.dumps(summary, indent=2))
-    return 0 if summary["status"] in ("COMPLETED", "STOPPED", "AWAITING_INPUT") else 1
+    return 0 if summary["status"] in ("COMPLETED", "STOPPED", "AWAITING_INPUT", "LIMIT_REACHED") else 1
 
 
 # ---------------------------------------------------------- status views
@@ -236,10 +236,69 @@ def cmd_approvals(args) -> int:
     return 0
 
 
+def _note(args) -> str:
+    if getattr(args, "note_stdin", False) or getattr(args, "text_stdin", False):
+        return sys.stdin.read()[:20000]
+    return (getattr(args, "note", None) or getattr(args, "text", None) or "")[:20000]
+
+
 def cmd_decide(args) -> int:
     cfg = _load(args)
-    _submit(cfg, "APPROVE" if args.command == "approve" else "REJECT", {"approval_id": args.approval_id, "note": args.note or ""})
+    _submit(cfg, "APPROVE" if args.command == "approve" else "REJECT", {"approval_id": args.approval_id, "note": _note(args)})
     return 0
+
+
+def cmd_answer(args) -> int:
+    """Answer a Product Manager question set; the answers are passed to the agents on the next run."""
+    cfg = _load(args)
+    state = StateManager(cfg.db_path)
+    row = state.query_one("SELECT * FROM approvals WHERE id = ? AND project_id = ?", (args.approval_id, cfg.project_id))
+    if not row or row["kind"] != "QUESTIONS":
+        print("No such question set for this project.", file=sys.stderr)
+        return 2
+    text = _note(args).strip()
+    if not text:
+        print("Provide the answers with --text or --text-stdin.", file=sys.stderr)
+        return 2
+    _submit(cfg, "APPROVE", {"approval_id": args.approval_id, "note": text})
+    return 0
+
+
+def cmd_validate_config(args) -> int:
+    cfg = _load(args)
+    print(f"OK: configuration for project {cfg.project_id} is valid ({cfg.config_path})")
+    return 0
+
+
+def cmd_resume_now(args) -> int:
+    cfg = _load(args)
+    StateManager(cfg.db_path).kv_set(f"limit_resume_now:{cfg.project_id}", "1")
+    print("The running controller stops waiting for the usage-limit reset and retries now.")
+    return 0
+
+
+def cmd_git_check(args) -> int:
+    """Check that the configured remote exists and that git credentials work (read-only ls-remote)."""
+    cfg = _load(args)
+    from git_manager import GitError, GitManager
+    from safe_exec import CommandPolicy, SafeExecutor
+
+    state = StateManager(cfg.db_path)
+    project = state.get_project(cfg.project_id) or {}
+    path = Path(project.get("workspace_path") or cfg.project_dir)
+    if not path.exists():
+        print(f"Project folder {path} does not exist yet (start the project once first).", file=sys.stderr)
+        return 2
+    policy = CommandPolicy(allowed_roots=[path, cfg.project_dir], allow_push=True, push_remote=cfg.project.git_remote, push_branch=cfg.project.development_branch)
+    git = GitManager(SafeExecutor(policy, state, actor="cli:git-check"), cfg.project.commit_author_name, cfg.project.commit_author_email)
+    try:
+        print(git.ensure_remote(path, cfg.project.git_remote, cfg.project.git_remote_url))
+    except GitError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    ok, message = git.check_remote(path, cfg.project.git_remote)
+    print(("OK: remote reachable and credentials work. " if ok else "FAIL: ") + message)
+    return 0 if ok else 1
 
 
 def cmd_report(args) -> int:
@@ -294,6 +353,8 @@ def cmd_project(args) -> int:
         for path in sorted((CONFIG_DIR / "projects").glob("*.json")):
             print(f"config file: {path}")
         return 0
+    if args.project_command == "delete":
+        return _delete_project(args)
     project_path = Path(args.path).expanduser().resolve()
     if args.mode == "existing" and not project_path.exists():
         print(f"{project_path} does not exist", file=sys.stderr)
@@ -311,6 +372,38 @@ def cmd_project(args) -> int:
     cfg = _load(args)
     StateManager(cfg.db_path).upsert_project(slug, name=args.name, path=str(project_path), mode=None if args.mode == "auto" else args.mode, config_path=str(target), status="REGISTERED")
     print(f"Project registered: {slug}\nConfig: {target}\nRun with: python main.py --config {target} run")
+    return 0
+
+
+def _delete_project(args) -> int:
+    """Remove a project's JSON under config/projects and hide it. Never touches the project folder,
+    its git repository, the worktree, reports or the recorded history."""
+    from config import DEFAULT_DB_PATH, load_secrets, resolve_path
+
+    project_id = slugify(args.project_id)
+    target = CONFIG_DIR / "projects" / f"{project_id}.json"
+    secrets = load_secrets()
+    state = StateManager(resolve_path(secrets.db_path) if secrets.db_path else DEFAULT_DB_PATH)
+    row = state.get_project(project_id)
+    if row and row.get("config_path"):
+        candidate = Path(row["config_path"]).resolve()
+        if candidate.parent == (CONFIG_DIR / "projects").resolve():
+            target = candidate
+    if target.resolve().parent != (CONFIG_DIR / "projects").resolve():
+        print("Only project files under config/projects can be deleted (the default config/project.json is kept).", file=sys.stderr)
+        return 2
+    if _orchestrator_running(state, project_id):
+        print(f"The controller is running for {project_id}; stop it first.", file=sys.stderr)
+        return 2
+    if not target.exists() and not row:
+        print(f"Unknown project {project_id}.", file=sys.stderr)
+        return 2
+    if target.exists():
+        target.unlink()
+    if row:
+        state.update_project(project_id, status="DELETED")
+    state.audit("cli", "delete_project", project_id, {"config": str(target)})
+    print(f"Deleted {target.name}. The project folder and its history were not touched.")
     return 0
 
 
@@ -345,7 +438,16 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("approval_id", type=int)
         p.add_argument("--note")
+        p.add_argument("--note-stdin", action="store_true", help="read the note from standard input")
         p.set_defaults(func=cmd_decide)
+    answer = sub.add_parser("answer", help="answer a Product Manager question set")
+    answer.add_argument("approval_id", type=int)
+    answer.add_argument("--text")
+    answer.add_argument("--text-stdin", action="store_true")
+    answer.set_defaults(func=cmd_answer)
+    sub.add_parser("validate-config").set_defaults(func=cmd_validate_config)
+    sub.add_parser("resume-now", help="stop waiting for a usage-limit reset").set_defaults(func=cmd_resume_now)
+    sub.add_parser("git-check", help="check the remote and git credentials (read-only)").set_defaults(func=cmd_git_check)
     project = sub.add_parser("project")
     psub = project.add_subparsers(dest="project_command", required=True)
     add = psub.add_parser("add")
@@ -354,6 +456,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--mode", choices=["auto", "new", "existing"], default="auto")
     add.add_argument("--force", action="store_true")
     psub.add_parser("list")
+    delete = psub.add_parser("delete", help="delete config/projects/<id>.json (the project folder is kept)")
+    delete.add_argument("project_id")
     project.set_defaults(func=cmd_project)
     return parser
 

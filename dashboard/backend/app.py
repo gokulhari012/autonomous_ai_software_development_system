@@ -26,6 +26,7 @@ from .auth import CSRF_COOKIE, SESSION_COOKIE, AuthManager
 from .controller import ControlError, ControllerBridge
 from .db import Database
 from .git_info import git_summary
+from .project_admin import ProjectAdmin, SettingsError
 from .settings import DASHBOARD_DIR, Settings, load_settings
 
 AGENTS = ["product_manager", "architect", "developer", "code_reviewer", "qa_engineer", "security_auditor", "bug_fixer", "devops_engineer", "product_validator"]
@@ -43,11 +44,25 @@ class ControlBody(BaseModel):
     task_id: int | None = None
     approval_id: int | None = None
     code: str | None = Field(None, max_length=20)
-    note: str | None = Field(None, max_length=500)
+    note: str | None = Field(None, max_length=20000)
     name: str | None = Field(None, max_length=80)
     path: str | None = Field(None, max_length=500)
     mode: Literal["new", "existing", "auto"] | None = None
     with_telegram_bot: bool = False
+    max_tasks: int | None = Field(None, ge=1, le=10000)
+    resume: bool = False
+    # project creation
+    brief: str | None = Field(None, max_length=50000)
+    settings: dict[str, Any] | None = None
+
+
+class SettingsBody(BaseModel):
+    project: dict[str, Any] = Field(default_factory=dict)
+    workflow: dict[str, Any] = Field(default_factory=dict)
+
+
+class BriefBody(BaseModel):
+    brief: str = Field(max_length=50000)
 
 
 class WsMessage(BaseModel):
@@ -56,11 +71,18 @@ class WsMessage(BaseModel):
     after_id: int = Field(0, ge=0)
 
 
+def _slug(value: str) -> str:
+    import re
+
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower() or "project"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     db = Database(settings.db_path)
     auth = AuthManager(settings.username, settings.password_hash, settings.secret_key, settings.session_hours)
     bridge = ControllerBridge(settings)
+    admin = ProjectAdmin(settings, bridge.run_cli)
     app = FastAPI(title="Autonomous Development Dashboard", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.db = db
@@ -79,9 +101,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def project_or_default(project: str | None) -> dict[str, Any]:
         if project:
-            row = db.one("SELECT * FROM projects WHERE id = ?", (project,))
+            row = db.one("SELECT * FROM projects WHERE id = ? AND status != 'DELETED'", (project,))
         else:
-            row = db.one("SELECT * FROM projects ORDER BY updated_at DESC LIMIT 1")
+            row = db.one("SELECT * FROM projects WHERE status != 'DELETED' ORDER BY updated_at DESC LIMIT 1")
         if not row:
             raise HTTPException(404, "no project found - start the controller once or add a project")
         return row
@@ -114,7 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------------------------------------------------------- projects
     @app.get("/api/projects")
     def projects(claims=Depends(user)):
-        rows = db.query("SELECT id, name, path, workspace_path, mode, status, current_stage, config_path, updated_at FROM projects ORDER BY updated_at DESC")
+        rows = db.query("SELECT id, name, path, workspace_path, mode, status, current_stage, config_path, updated_at FROM projects WHERE status != 'DELETED' ORDER BY updated_at DESC")
         for row in rows:
             row["controller"] = {k: v for k, v in db.controller_state(row["id"]).items() if k != "lock"}
         return rows
@@ -142,7 +164,100 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "last_run": last_run,
             "recent_events": db.query("SELECT * FROM events WHERE project_id = ? ORDER BY id DESC LIMIT 25", (pid,)),
             "pending_approvals": db.query("SELECT * FROM approvals WHERE project_id = ? AND status = 'PENDING'", (pid,)),
+            "limit_wait": kv_json(f"limit_wait:{pid}"),
+            "last_push": kv_json(f"last_push:{pid}"),
+            "attention": attention(proj, controller, last_run),
         }
+
+    def kv_json(key: str) -> dict[str, Any] | None:
+        row = db.one("SELECT value FROM kv WHERE key = ?", (key,))
+        if not row or not row["value"]:
+            return None
+        try:
+            return json.loads(row["value"])
+        except ValueError:
+            return None
+
+    def attention(proj: dict[str, Any], controller: dict[str, Any], last_run: dict[str, Any] | None) -> list[dict[str, str]]:
+        """Things that need the user, each with a plain-language fix (shown on Overview and Troubleshooting)."""
+        pid = proj["id"]
+        items: list[dict[str, str]] = []
+        for a in db.query("SELECT * FROM approvals WHERE project_id = ? AND status = 'PENDING' ORDER BY id", (pid,)):
+            fix = {"QUESTIONS": "Answer the questions in Control Panel > Questions, then press 'Save answers and resume'.",
+                   "REQUIREMENT": "Approve or reject the requirement in Control Panel > Approvals.",
+                   "TECH_STACK": "Approve or reject the proposed technology stack in Control Panel > Approvals, then start again.",
+                   }.get(a["kind"], "Decide it in Control Panel > Approvals.")
+            items.append({"level": "action", "title": f"{a['kind'].replace('_', ' ').title()} waiting for you (#{a['id']})", "fix": fix})
+        for t in db.query("SELECT id, title, blocked_reason FROM tasks WHERE project_id = ? AND status = 'BLOCKED'", (pid,)):
+            reason = t.get("blocked_reason") or ""
+            fix = "Fix the cause, then press Retry in the Task Manager."
+            if "No module named" in reason or "pip" in reason.lower() or "not installed" in reason:
+                fix = "A Python package the app needs is missing in the controller's environment. Install it (see Troubleshooting) or ask for a simpler stack in the project settings, then Retry."
+            elif "approval" in reason:
+                fix = "Approve the pending item in Control Panel > Approvals; the task resumes automatically."
+            elif "security review" in reason:
+                fix = "A HIGH/CRITICAL security finding needs a human decision. Review it in the Security Center."
+            items.append({"level": "error", "title": f"Task #{t['id']} blocked: {t['title']}", "detail": reason[:500], "fix": fix})
+        wait = kv_json(f"limit_wait:{pid}")
+        if wait and wait.get("until"):
+            items.append({"level": "info", "title": "Waiting for the Claude usage limit to reset", "detail": wait.get("reason", ""),
+                          "fix": "Nothing to do; it resumes automatically. Use 'Resume now' to retry immediately."})
+        push = kv_json(f"last_push:{pid}")
+        if push and not push.get("ok"):
+            items.append({"level": "error", "title": "Last GitHub push failed", "detail": push.get("message", ""),
+                          "fix": "Check the repository URL in Settings and press 'Test GitHub connection' in Troubleshooting. Commits are kept locally and pushed on the next checkpoint."})
+        if last_run and last_run["status"] in ("ERROR", "BLOCKED", "LIMIT_REACHED") and not controller["running"]:
+            items.append({"level": "error", "title": f"Last run ended with {last_run['status']}", "detail": last_run.get("stop_reason") or "",
+                          "fix": "Read the reason and the logs in Troubleshooting, fix it, then Start again. State is saved."})
+        if proj.get("mode") == "new":
+            try:
+                brief = admin.read_brief(proj)
+                if not brief["brief"].strip() or brief["is_template"]:
+                    items.append({"level": "action", "title": "Project description is empty", "fix": "Describe the project in Control Panel > Project brief, then Start."})
+            except (SettingsError, OSError, ValueError):
+                pass
+        return items
+
+    # ---------------------------------------------------- settings/brief
+    def admin_call(fn, *args):
+        try:
+            return fn(*args)
+        except SettingsError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}/settings")
+    def get_settings(project_id: str, claims=Depends(user)):
+        return admin_call(admin.read_settings, project_or_default(project_id))
+
+    @app.put("/api/projects/{project_id}/settings")
+    def put_settings(project_id: str, body: SettingsBody, claims=Depends(user)):
+        proj = project_or_default(project_id)
+        if db.controller_state(proj["id"])["running"]:
+            raise HTTPException(409, "stop the controller before changing settings (they are read when a run starts)")
+        result = admin_call(admin.update_settings, proj, body.project, body.workflow)
+        db.audit(f"dashboard:{claims['sub']}", "update_settings", proj["id"], {"project": sorted(body.project), "workflow": sorted(body.workflow)})
+        return result
+
+    @app.get("/api/projects/{project_id}/brief")
+    def get_brief(project_id: str, claims=Depends(user)):
+        return admin_call(admin.read_brief, project_or_default(project_id))
+
+    @app.put("/api/projects/{project_id}/brief")
+    def put_brief(project_id: str, body: BriefBody, claims=Depends(user)):
+        proj = project_or_default(project_id)
+        result = admin_call(admin.write_brief, proj, body.brief)
+        db.audit(f"dashboard:{claims['sub']}", "update_brief", proj["id"], {"chars": len(body.brief)})
+        return result
+
+    @app.get("/api/questions")
+    def questions(project: str | None = None, claims=Depends(user)):
+        pid = project_or_default(project)["id"]
+        return db.query("SELECT * FROM approvals WHERE project_id = ? AND kind = 'QUESTIONS' ORDER BY id DESC", (pid,))
+
+    @app.get("/api/logs")
+    def logs(project: str | None = None, lines: int = Query(300, ge=10, le=3000), contains: str | None = Query(None, max_length=100), claims=Depends(user)):
+        pid = project_or_default(project)["id"] if project else None
+        return admin.tail_logs(lines, pid, contains)
 
     # ------------------------------------------------------------ agents
     @app.get("/api/agents")
@@ -370,11 +485,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def control(action: str, body: ControlBody, claims=Depends(user)):
         actor = f"dashboard:{claims['sub']}"
         try:
-            if action in ("new_project", "open_project"):
+            if action in ("new_project", "open_project", "create_project"):
                 if not body.name or not body.path:
                     raise ControlError("name and path are required")
-                result = bridge.add_project(body.name, body.path, "new" if action == "new_project" else (body.mode or "existing"))
-                db.audit(actor, action, body.path, {"name": body.name})
+                mode = body.mode or ("new" if action == "new_project" else "existing")
+                result = bridge.add_project(body.name, body.path, mode)
+                if not result["ok"]:
+                    raise ControlError(result["output"][-500:])
+                db.audit(actor, action, body.path, {"name": body.name, "mode": mode})
+                created = db.one("SELECT * FROM projects WHERE id = ?", (_slug(body.name),))
+                if created and body.settings:
+                    try:
+                        admin.update_settings(created, body.settings, {})
+                    except SettingsError as exc:
+                        raise ControlError(f"project created, but settings were rejected: {exc}") from exc
+                if created and body.brief and body.brief.strip():
+                    try:
+                        if mode == "new":
+                            admin.write_brief(created, body.brief)
+                        else:  # existing projects: the description goes to the Product Manager as project notes
+                            admin.update_settings(created, {"project_notes": body.brief}, {})
+                    except SettingsError as exc:
+                        raise ControlError(f"project created, but the description could not be saved: {exc}") from exc
+                result["project_id"] = created["id"] if created else None
                 return result
             proj = project_or_default(body.project)
             pid, config_path = proj["id"], proj.get("config_path")
@@ -383,7 +516,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if state["running"]:
                     raise ControlError("the controller is already running for this project")
                 db.set_flag(f"stop:{pid}", "0", actor)
-                result = bridge.start(config_path, pid, body.with_telegram_bot)
+                db.set_flag(f"pause:{pid}", "0", actor)
+                result = bridge.start(config_path, pid, body.with_telegram_bot, body.max_tasks)
+            elif action == "delete_project":
+                if db.controller_state(pid)["running"]:
+                    raise ControlError("stop the controller for this project before deleting it")
+                result = bridge.run_cli(None, ["project", "delete", pid])
+                if not result["ok"]:
+                    raise ControlError(result["output"][-400:])
+            elif action == "answer_questions":
+                if body.approval_id is None or not (body.note or "").strip():
+                    raise ControlError("approval_id and the answers are required")
+                result = bridge.run_cli(config_path, ["answer", str(int(body.approval_id)), "--text-stdin"], stdin_text=body.note)
+                if result["ok"] and body.resume and not db.controller_state(pid)["running"]:
+                    db.set_flag(f"stop:{pid}", "0", actor)
+                    result["started"] = bridge.start(config_path, pid, body.with_telegram_bot, body.max_tasks)
+            elif action == "resume_now":
+                result = bridge.run_cli(config_path, ["resume-now"])
+            elif action == "doctor":
+                result = bridge.run_cli(config_path, ["doctor"], timeout=240)
+            elif action == "telegram_test":
+                result = bridge.run_cli(config_path, ["telegram-test"], timeout=90)
+            elif action == "git_check":
+                result = bridge.run_cli(config_path, ["git-check"], timeout=120)
+            elif action == "validate_config":
+                result = bridge.run_cli(config_path, ["validate-config"], timeout=60)
             elif action in ("pause", "resume", "stop"):
                 if action == "pause":
                     db.set_flag(f"pause:{pid}", "1", actor)
@@ -400,8 +557,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             elif action in ("approve", "reject"):
                 if body.approval_id is None:
                     raise ControlError("approval_id is required")
-                args = [action, str(int(body.approval_id))] + (["--note", body.note] if body.note else [])
-                result = bridge.run_cli(config_path, args)
+                result = bridge.run_cli(config_path, [action, str(int(body.approval_id)), "--note-stdin"], stdin_text=body.note or "")
             elif action in ("approve_requirement", "reject_requirement"):
                 result = bridge.run_cli(config_path, [action.replace("_", "-"), bridge.validate_code(body.code or "")])
             elif action == "generate_report":

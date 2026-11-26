@@ -90,9 +90,47 @@ python main.py --config config/projects/my-app.json run
 | `report` | Write the final project report to `reports/releases/` |
 | `telegram-bot` | Run the Telegram command bot on its own (long polling) |
 
+| `answer <id> --text "..."` | Answer a Product Manager question set (passed to the agents on the next run) |
+| `project delete <id>` | Delete `config/projects/<id>.json` and hide the project; its folder and history are kept |
+| `git-check` | Check the GitHub remote and that your git login works (read-only) |
+| `resume-now` | Stop waiting for a usage-limit reset and retry immediately |
+| `validate-config` | Check a project configuration file |
+
 The same controls exist in Telegram (`/status /tasks /agents /logs /report /pause /resume /stop`)
 and in the dashboard. All of them write persistent flags or commands, which the running
 orchestrator applies at its next safe point.
+
+### Everything from the dashboard
+
+You can do all of the above in the dashboard without a terminal:
+
+* **Projects**: create a new or existing project with a large description box (saved as
+  `requirements/brief.md` for new projects; for existing projects it is given to the Product
+  Manager as project notes), choose the application type, the finish point, GitHub push and
+  auto-resume. You can also edit the description later, and delete a project (only its settings
+  file; the folder is kept).
+* **Control Panel**: Start (optionally limited to N tasks), Pause, Resume, Stop. Answer the
+  Product Manager's questions and press **Save answers and resume**. Handle approvals and reports.
+* **Task Manager**: Retry or Cancel tasks.
+* **Settings**: every project option and the global limits (model, budget, run time, retries),
+  validated by the controller before they are saved.
+* **Troubleshooting**: what needs your attention and how to fix it, an environment check, a
+  configuration check, a GitHub connection test, a Telegram test message, and live logs.
+
+Installing Python packages is deliberately not possible from the browser; do that in a terminal.
+
+### Finish point, GitHub push and auto-resume (project settings)
+
+| Setting | Values |
+|---|---|
+| `stop_after` | `task` stops after each completed task; `requirements` (default) stops when no work is left; `manual` keeps running and waits for new work until you press Stop |
+| `git_push_enabled`, `git_remote`, `git_remote_url` | Push the `autonomous-development` branch after every checkpoint commit. It never pushes `main`, never forces, and never deletes. Authentication uses the git login already on this computer (Git Credential Manager or an SSH key); no token is stored. A failed push is reported, and the next checkpoint retries it. |
+| `auto_resume_on_limit` | When the Claude usage limit is reached, wait until it resets (plus one minute) and continue the interrupted stage. If the reset time is unknown it retries every 15 minutes. When off, the run stops cleanly with status `LIMIT_REACHED`, and you start it again later. Waiting time does not count against `max_execution_minutes`. |
+
+Commit history for a new project: `chore: baseline snapshot` (your brief), then
+`docs: add project brief, specification and architecture`, then one commit per completed task
+(`chore: initialize project structure`, `feat: ...`, `fix: ...`, `security: ...`). Each commit body
+lists what was implemented, what was fixed during review and testing, and the validated acceptance criteria.
 
 ### Offline demonstration (no Claude usage)
 

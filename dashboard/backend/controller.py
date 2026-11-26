@@ -38,6 +38,8 @@ class ControllerBridge:
         env = dict(os.environ)
         for key in [k for k in env if k.startswith("DASHBOARD_")]:
             env.pop(key)  # never pass dashboard secrets to the controller
+        env["AUTODEV_DB_PATH"] = str(self.settings.db_path)  # the controller uses the database this dashboard shows
+        env["PYTHONIOENCODING"] = "utf-8"
         return env
 
     def _base(self, config_path: str | None) -> list[str]:
@@ -50,13 +52,19 @@ class ControllerBridge:
             argv += ["--config", str(path)]
         return argv + ["--quiet"]
 
-    def run_cli(self, config_path: str | None, args: list[str], timeout: int = 120) -> dict[str, Any]:
+    def run_cli(self, config_path: str | None, args: list[str], timeout: int = 120, stdin_text: str | None = None) -> dict[str, Any]:
         argv = self._base(config_path) + args
-        result = subprocess.run(argv, cwd=self.settings.controller_dir, capture_output=True, text=True, timeout=timeout, env=self._env())
-        return {"ok": result.returncode == 0, "exit_code": result.returncode, "output": (result.stdout + result.stderr)[-4000:]}
+        try:
+            result = subprocess.run(argv, cwd=self.settings.controller_dir, capture_output=True, text=True, timeout=timeout,
+                                    env=self._env(), input=stdin_text, encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "exit_code": None, "output": f"timed out after {timeout}s"}
+        return {"ok": result.returncode == 0, "exit_code": result.returncode, "output": (result.stdout + result.stderr)[-6000:]}
 
-    def start(self, config_path: str | None, project_id: str, with_telegram_bot: bool) -> dict[str, Any]:
+    def start(self, config_path: str | None, project_id: str, with_telegram_bot: bool, max_tasks: int | None = None) -> dict[str, Any]:
         argv = self._base(config_path) + ["run"] + (["--with-telegram-bot"] if with_telegram_bot else [])
+        if max_tasks:
+            argv += ["--max-tasks", str(int(max_tasks))]
         log_path = self.settings.logs_dir / f"dashboard-launch-{project_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         kwargs: dict[str, Any] = {}

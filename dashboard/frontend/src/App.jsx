@@ -13,9 +13,14 @@ import GitView from "./pages/GitView.jsx";
 import Deployments from "./pages/Deployments.jsx";
 import Usage from "./pages/Usage.jsx";
 import Control from "./pages/Control.jsx";
+import Projects from "./pages/Projects.jsx";
+import Settings from "./pages/Settings.jsx";
+import Troubleshoot from "./pages/Troubleshoot.jsx";
 
 const PAGES = [
   ["overview", "Overview", Overview],
+  ["projects", "Projects", Projects],
+  ["control", "Control Panel", Control],
   ["agents", "Agent Monitor", Agents],
   ["console", "Live Console", Console],
   ["tasks", "Task Manager", Tasks],
@@ -24,7 +29,8 @@ const PAGES = [
   ["git", "Git Management", GitView],
   ["deployments", "Deployment Monitor", Deployments],
   ["usage", "Usage & Cost", Usage],
-  ["control", "Control Panel", Control],
+  ["settings", "Settings", Settings],
+  ["troubleshoot", "Troubleshooting", Troubleshoot],
 ];
 
 function currentPage() {
@@ -87,9 +93,9 @@ function Shell({ user, page, project, setProject }) {
           <span>Event stream <Badge value={stream.status} /></span>
         </header>
         {projects.data && projects.data.length === 0 && (
-          <div className="notice">No project yet. Start the controller once (python main.py run) or add a project in the Control Panel.</div>
+          <div className="notice">No project yet. Create one on the <a href="#projects">Projects</a> page.</div>
         )}
-        <Page project={effectiveProject} events={stream.events} projects={projects.data || []} reloadProjects={projects.reload} />
+        <Page project={effectiveProject} events={stream.events} projects={projects.data || []} reloadProjects={projects.reload} selectProject={setProject} />
       </main>
     </div>
   );

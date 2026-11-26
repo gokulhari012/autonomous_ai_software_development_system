@@ -296,10 +296,19 @@ def test_full_pyside_pipeline(tmp_path):
         "security_auditor": lambda call: {"status": "PASS", "summary": "no issues"},
         "product_validator": validator,
     }
-    orch, _, fake = _orchestrator(tmp_path, project, handlers, pyside={"startup_seconds": 4})
+    bare = tmp_path / "github-stand-in.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=project, check=True, capture_output=True)
+    orch, _, fake = _orchestrator(tmp_path, project, handlers, pyside={"startup_seconds": 4}, git_push_enabled=True, stop_after="task")
     summary = asyncio.run(orch.run(max_tasks=3))
     task = orch.state.list_tasks(orch.pid)[0]
-    assert summary["status"] == "COMPLETED" and task["status"] == "COMPLETED", task.get("blocked_reason")
+    assert task["status"] == "COMPLETED", task.get("blocked_reason")
+    assert summary["status"] == "STOPPED" and "stop_after=task" in summary["reason"]  # stops after each completed task
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=orch.workspace, capture_output=True, text=True).stdout.strip()
+    pushed = subprocess.run(["git", "rev-parse", "autonomous-development"], cwd=bare, capture_output=True, text=True).stdout.strip()
+    assert pushed == head  # the checkpoint commit reached the remote
+    body = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=orch.workspace, capture_output=True, text=True).stdout
+    assert "Validated acceptance criteria:" in body
     runs = {r["test_type"]: r for r in reversed(orch.state.list_test_runs(orch.pid, task["id"]))}
     assert runs["qt"]["status"] == "PASS" and runs["qt"]["passed"] == 8
     assert runs["gui"]["status"] == "BLOCKED"

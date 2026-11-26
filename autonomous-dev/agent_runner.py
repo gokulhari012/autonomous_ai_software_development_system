@@ -74,6 +74,14 @@ class TurnLimitExceeded(AgentError):
     pass
 
 
+class UsageLimitReached(AgentError):
+    """The Claude plan/API usage limit was hit. ``resets_at`` is a unix timestamp when known."""
+
+    def __init__(self, message: str, resets_at: float | None = None):
+        super().__init__(message, retryable=False)
+        self.resets_at = resets_at
+
+
 # ---------------------------------------------------------------- definitions
 @dataclass
 class AgentDefinition:
@@ -161,6 +169,8 @@ class BackendResult:
     model: str | None = None
     assistant_error: str | None = None
     tool_calls: int = 0
+    rate_limit_rejected: bool = False
+    rate_limit_resets_at: float | None = None
 
 
 @dataclass
@@ -320,6 +330,9 @@ class ClaudeAgentBackend:
                             )
                 elif isinstance(message, RateLimitEvent):
                     info = message.rate_limit_info
+                    if info.status == "rejected":
+                        result.rate_limit_rejected = True
+                        result.rate_limit_resets_at = float(info.resets_at) if info.resets_at else None
                     if info.status != "allowed":
                         ctx.emit(
                             "AGENT_RATE_LIMITED",
@@ -530,7 +543,7 @@ class AgentRunner:
                 message = redact(f"{type(exc).__name__}: {exc}")[:2000]
                 self.state.finish_agent_run(agent_run_id, status="ERROR", error_message=message)
                 self.events.publish("AGENT_FAILED", f"{definition.name} failed: {message[:300]}", status="ERROR", task_id=request.task_id, agent=definition.name, metadata={"agent_run_id": agent_run_id})
-                if isinstance(exc, (FatalAgentError, BudgetExceeded, TurnLimitExceeded)) or not isinstance(exc, Exception):
+                if isinstance(exc, (FatalAgentError, BudgetExceeded, TurnLimitExceeded, UsageLimitReached)) or not isinstance(exc, Exception):
                     raise
                 return AgentResult(definition.name, Status.ERROR, None, agent_run_id, self.backend.name, error=message, denials=guard.denials)
 
@@ -589,8 +602,13 @@ class AgentRunner:
             raise FatalAgentError(f"Claude API {result.assistant_error}: check authentication and billing")
         if result.error_subtype == "error_max_budget_usd":
             raise BudgetExceeded("agent call stopped by max_budget_usd")
+        if result.rate_limit_rejected and (result.is_error or result.structured_output is None):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(result.rate_limit_resets_at)) if result.rate_limit_resets_at else "unknown"
+            raise UsageLimitReached(f"Claude usage limit reached (resets at {when})", result.rate_limit_resets_at)
         if result.is_error and (result.api_error_status in RETRYABLE_HTTP or result.assistant_error in {"rate_limit", "server_error"}):
-            raise AgentError(f"transient API error {result.api_error_status or result.assistant_error}", retryable=True)
+            error = AgentError(f"transient API error {result.api_error_status or result.assistant_error}", retryable=True)
+            error.rate_limited = result.api_error_status == 429 or result.assistant_error == "rate_limit"  # type: ignore[attr-defined]
+            raise error
         return result
 
     def _validate(self, ctx: AgentContext, result: BackendResult) -> tuple[AgentOutputBase | None, str]:
@@ -614,6 +632,8 @@ class AgentRunner:
                 result = await self._invoke(ctx, prompt, None)
                 break
             except AgentError as exc:
+                if exc.retryable and attempt > wf.transient_retry_attempts and getattr(exc, "rate_limited", False):
+                    raise UsageLimitReached(f"Claude rate/usage limit persisted after {attempt - 1} retries", None) from exc
                 if not exc.retryable or isinstance(exc, FatalAgentError) or attempt > wf.transient_retry_attempts:
                     raise
                 delay = min(wf.backoff_max_seconds, wf.backoff_base_seconds * 2 ** (attempt - 1)) * (0.8 + random.random() * 0.4)

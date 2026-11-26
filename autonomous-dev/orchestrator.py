@@ -47,6 +47,7 @@ from agent_runner import (
     FatalAgentError,
     ScriptedBackend,
     TurnLimitExceeded,
+    UsageLimitReached,
 )
 from config import BACKUPS_DIR, REPORTS_DIR, WORKSPACES_DIR, AppConfig, ensure_runtime_dirs, severity_rank
 from deployment_manager import DeploymentManager, DeploymentResult
@@ -172,7 +173,14 @@ class Orchestrator:
         self.policy = CommandPolicy(
             allowed_roots=[project_dir, WORKSPACES_DIR, REPORTS_DIR, BACKUPS_DIR, config.worktree_path()],
             python_executables=sorted({self.python, sys.executable}),
+            allow_push=config.project.git_push_enabled,
+            push_remote=config.project.git_remote,
+            push_branch=config.project.development_branch,
+            protected_branches={config.project.default_branch, "main", "master"},
         )
+        self._push_ready = False
+        self.limit_margin_seconds = 60  # wait this long past the reported reset time
+        self.limit_probe_seconds = 15 * 60  # retry interval when the reset time is unknown
         self.executor = SafeExecutor(self.policy, self.state)
         self.git = GitManager(self.executor, config.project.commit_author_name, config.project.commit_author_email)
         self.workspace: Path | None = None
@@ -184,6 +192,7 @@ class Orchestrator:
         self.mode: str | None = None
         self.started = time.monotonic()
         self.stop_reason: str | None = None
+        self.stop_status: str | None = None
         self._stop = asyncio.Event()
         self._active: set[int] = set()
         self._serial = asyncio.Lock()
@@ -208,9 +217,18 @@ class Orchestrator:
             self._recover()
             self._prepare_workspace()
             self._apply_control_commands()
-            await self._project_stages()
-            reason = await self._task_loop(max_tasks or self.config.project.max_tasks_per_run)
-            status = "STOPPED" if self.stop_reason else "COMPLETED"
+            self.state.update_project(self.pid, status="ACTIVE")
+            while True:
+                try:
+                    await self._project_stages()
+                    reason = await self._task_loop(max_tasks or self.config.project.max_tasks_per_run)
+                    break
+                except UsageLimitReached as exc:  # raised by project-level agents (planning, analysis)
+                    await self._handle_usage_limit(exc)
+                    if self._stop_requested():
+                        reason = self.stop_reason or "stopped while waiting for the usage limit"
+                        break
+            status = self.stop_status or ("STOPPED" if self.stop_reason else "COMPLETED")
             await self._finish_project_if_done()
         except ProjectInputRequired as exc:
             status, reason = exc.status, exc.reason
@@ -349,6 +367,67 @@ class Orchestrator:
             log.info("workspace: %s", note)
         self.events.publish("PROJECT_STAGE_CHANGED", f"workspace ready on {info.dev_branch} at {self.workspace}", status="OK", metadata={"notes": info.notes, "isolation": info.isolation, "user_uncommitted_changes": len(info.user_uncommitted_changes)})
         self._refresh_profile()
+        self._setup_remote()
+
+    # ============================================================ git push
+    def _setup_remote(self) -> None:
+        cfg = self.config.project
+        if not cfg.git_push_enabled or not self.workspace:
+            return
+        try:
+            message = self.git.ensure_remote(self.workspace, cfg.git_remote, cfg.git_remote_url)
+            self._push_ready = True
+            self.events.publish("PROJECT_STAGE_CHANGED", f"git push enabled: {message}; branch {cfg.development_branch} will be pushed after each checkpoint", status="OK")
+        except GitError as exc:
+            self._push_ready = False
+            self.events.publish("GIT_PUSH_FAILED", f"git push disabled for this run: {exc}", status="ERROR")
+            self.notifier.notify("SYSTEM_ERROR", "GitHub push not available", {"Remote": cfg.git_remote}, [str(exc)[:300]],
+                                 footer="Set the repository URL in the project settings (dashboard) or add the remote yourself.")
+
+    async def _push(self, context: str, task_id: int | None = None) -> None:
+        cfg = self.config.project
+        if not (cfg.git_push_enabled and self._push_ready and self.workspace):
+            return
+        async with self._serial:
+            ok, message = await asyncio.to_thread(self.git.push, self.workspace, cfg.git_remote, cfg.development_branch)
+        self.state.kv_set(f"last_push:{self.pid}", json.dumps({"ok": ok, "message": message[:500], "context": context, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}))
+        if ok:
+            self.events.publish("GIT_PUSHED", f"{context}: {message}", status="OK", task_id=task_id)
+        else:
+            self.events.publish("GIT_PUSH_FAILED", f"{context}: {message[:400]}", status="ERROR", task_id=task_id)
+            self.notifier.notify("SYSTEM_ERROR", "GitHub push failed", {"Branch": cfg.development_branch, "Remote": cfg.git_remote}, [message[:400]],
+                                 footer="The commit is safe locally; the next checkpoint retries the push.", dedupe_key=f"push-failed-{fingerprint(message[:120])}")
+
+    # ======================================================== usage limits
+    async def _handle_usage_limit(self, exc: UsageLimitReached) -> None:
+        """Wait for the Claude usage limit to reset (auto-resume) or stop the run cleanly."""
+        if not self.config.project.auto_resume_on_limit:
+            self.notifier.notify("SYSTEM_STOPPED", "Claude usage limit reached", {"Status": "STOPPED"}, [str(exc)],
+                                 footer="State is saved. Start again after the limit resets, or enable auto-resume in the project settings.")
+            raise StopRun(f"{exc} - run stopped (auto-resume is off)", "LIMIT_REACHED")
+        now = time.time()
+        if exc.resets_at and exc.resets_at > now:
+            until = exc.resets_at + self.limit_margin_seconds
+        else:
+            until = now + self.limit_probe_seconds  # unknown reset time: probe again later
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(until))
+        self.state.kv_set(f"limit_wait:{self.pid}", json.dumps({"until": until, "reason": str(exc)}))
+        self.state.update_project(self.pid, status="WAITING_FOR_LIMIT")
+        self.events.publish("SYSTEM_PAUSED", f"{exc}; waiting until {when} and then resuming automatically", status="WAITING_FOR_LIMIT", metadata={"until": until})
+        self.notifier.notify("SYSTEM_PAUSED", "Usage limit reached - will resume automatically", {"Resumes at": when}, [str(exc)], dedupe_key=f"limit-{int(until // 600)}")
+        started_wait = time.monotonic()
+        while time.time() < until and not self._stop_requested():
+            self._apply_control_commands()
+            if self.state.kv_get(f"limit_resume_now:{self.pid}") == "1":
+                self.state.kv_set(f"limit_resume_now:{self.pid}", "0")
+                break
+            await asyncio.sleep(min(5.0, max(0.2, until - time.time())))
+        self.started += time.monotonic() - started_wait  # waiting does not count against max_execution_minutes
+        self.state.kv_set(f"limit_wait:{self.pid}", "")
+        self.state.update_project(self.pid, status="ACTIVE")
+        if not self._stop_requested():
+            self.events.publish("SYSTEM_RESUMED", "resuming after the usage-limit wait", status="RUNNING")
+            self.notifier.notify("SYSTEM_RESUMED", "Resumed after usage limit", {"Status": "RUNNING"})
 
     def _refresh_profile(self) -> ProjectProfile:
         assert self.workspace is not None
@@ -482,10 +561,38 @@ class Orchestrator:
         task_lines = [f"- #{t['id']} [{t['status']}] {t['title']}" for t in tasks] or ["- (empty)"]
         return "## Existing requirements registry\n" + "\n".join(req_lines) + "\n\n## Existing tasks\n" + "\n".join(task_lines)
 
+    def _owner_input(self) -> str:
+        """Project notes and every answered question round, passed to planning agents as authoritative input."""
+        parts: list[str] = []
+        notes = self.config.project.project_notes.strip()
+        if notes:
+            parts.append(f"## Project description from the owner\n{notes}")
+        answered = [a for a in self.state.list_approvals(self.pid) if a["kind"] == "QUESTIONS" and a["status"] == "APPROVED"]
+        for item in answered:
+            questions = (item.get("details") or {}).get("questions", [])
+            parts.append("## Questions you asked earlier\n" + "\n".join(f"- {q}" for q in questions) +
+                         f"\n### Answer from the project owner (authoritative)\n{item.get('decision_note') or '(no answer text)'}")
+        return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+    def _ask_questions(self, stage: Stage, questions: list[str], summary: str) -> ProjectInputRequired:
+        questions = [q for q in questions if q.strip()] or [summary]
+        round_no = sum(1 for a in self.state.list_approvals(self.pid) if a["kind"] == "QUESTIONS") + 1
+        approval_id, _ = self.state.request_approval(self.pid, "QUESTIONS", f"{stage.value}:{round_no}", {"stage": stage.value, "questions": questions})
+        self.notifier.notify("APPROVAL_REQUIRED", "The Product Manager has questions", {"Questions": len(questions)}, questions,
+                             footer="Answer them in the dashboard (Control Panel > Questions), then resume.", dedupe_key=f"questions-{approval_id}")
+        return ProjectInputRequired(f"The Product Manager needs answers to {len(questions)} question(s) (question set #{approval_id}). "
+                                    "Answer them in the dashboard Control Panel, or with: python main.py answer " + str(approval_id))
+
+    def _close_question_rounds(self, stage: Stage) -> None:
+        for item in self.state.list_approvals(self.pid, "PENDING"):
+            if item["kind"] == "QUESTIONS" and str(item["subject"]).startswith(stage.value + ":"):
+                self.state.decide_approval(item["id"], False, "orchestrator", "superseded: the Product Manager no longer needs this information")
+
     async def _requirement_analysis(self):
         assert self.workspace and self.profile
         prompt = (
             "# Requirement analysis for an existing application\n\n"
+            f"{self._owner_input()}"
             f"## Detected project profile\n```json\n{self._profile_summary()}\n```\n\n"
             f"## Baseline results (run by the orchestrator)\n{self._baseline_summary()}\n\n"
             f"{self._registry_text()}\n\n"
@@ -498,7 +605,8 @@ class Orchestrator:
         if not result.output or result.status == Status.ERROR:
             raise StopRun(f"requirement analysis failed: {result.error}", "ERROR")
         if result.output.status == Status.BLOCKED:
-            raise ProjectInputRequired("Product Manager needs input: " + "; ".join(result.output.questions or [result.output.summary]))
+            raise self._ask_questions(Stage.REQUIREMENT_ANALYSIS, result.output.questions, result.output.summary)
+        self._close_question_rounds(Stage.REQUIREMENT_ANALYSIS)
         return result.output
 
     async def _task_planning(self, output) -> None:
@@ -542,19 +650,24 @@ class Orchestrator:
         brief_text = brief.read_text(encoding="utf-8")[:20000]
         if self.config.project.require_project_discovery and not self._stage_done(Stage.PROJECT_DISCOVERY):
             async def discovery():
-                prompt = f"# Project discovery\n\n## Project brief ({self.config.project.project_brief})\n{brief_text}\n\nCheck whether the brief contains enough information (purpose, users, features, workflows, technology preferences, data, UI, integrations, deployment). If critical information is missing return BLOCKED with precise questions. Do not invent business requirements."
+                prompt = (f"# Project discovery\n\n## Project brief ({self.config.project.project_brief})\n{brief_text}\n\n{self._owner_input()}"
+                          "Check whether the brief together with the owner's answers contains enough information (purpose, users, features, workflows, "
+                          "technology preferences, data, UI, integrations, deployment). If critical information is still missing return BLOCKED with "
+                          "precise questions; never repeat a question the owner already answered. Do not invent business requirements.")
                 result = await self._agent("product_manager", prompt, None, Stage.PROJECT_DISCOVERY.value)
                 if not result.output or result.status == Status.ERROR:
                     raise StopRun(f"project discovery failed: {result.error}", "ERROR")
                 if result.output.status == Status.BLOCKED or result.output.questions and result.output.status != Status.PASS:
                     questions_path = brief.parent / "open_questions.md"
-                    questions_path.write_text("# Open questions from the Product Manager\n\nAnswer them in the project brief and run the controller again.\n\n" + "\n".join(f"- {q}" for q in result.output.questions), encoding="utf-8")
-                    raise ProjectInputRequired(f"The Product Manager needs more information; see {questions_path}")
+                    questions_path.write_text("# Open questions from the Product Manager\n\nAnswer them in the dashboard (Control Panel > Questions) "
+                                              "or in the project brief, then run the controller again.\n\n" + "\n".join(f"- {q}" for q in result.output.questions), encoding="utf-8")
+                    raise self._ask_questions(Stage.PROJECT_DISCOVERY, result.output.questions, result.output.summary)
+                self._close_question_rounds(Stage.PROJECT_DISCOVERY)
             await self._project_stage(Stage.PROJECT_DISCOVERY, discovery)
 
         if not self._stage_done(Stage.PROJECT_SPECIFICATION):
             async def specification():
-                prompt = (f"# Project specification\n\n## Project brief\n{brief_text}\n\n{self._registry_text()}\n\n"
+                prompt = (f"# Project specification\n\n## Project brief\n{brief_text}\n\n{self._owner_input()}{self._registry_text()}\n\n"
                           "Write docs/PRD.md and return all requirements (source 'documented', source_reference the brief) with testable "
                           "acceptance criteria, plus development tasks ordered: core infrastructure, database, backend, API, UI, authentication, "
                           "business logic, integrations, reporting, extras. Do NOT include a project-initialisation task; the orchestrator adds it.")
@@ -573,7 +686,7 @@ class Orchestrator:
                     raise ProjectInputRequired("The proposed technology stack was rejected; update the brief's technology preferences and reset the PROJECT_ARCHITECTURE stage.")
                 if approval == "APPROVED":
                     return
-                prompt = (f"# Architecture for a new project\n\n## Project brief\n{brief_text}\n\nRead docs/PRD.md. Write docs/architecture.md as described in your instructions. "
+                prompt = (f"# Architecture for a new project\n\n## Project brief\n{brief_text}\n\n{self._owner_input()}Read docs/PRD.md. Write docs/architecture.md as described in your instructions. "
                           "If the brief states no technology preference, recommend a stack with reasons and set requires_human_approval.")
                 result = await self._agent("architect", prompt, None, Stage.PROJECT_ARCHITECTURE.value)
                 if not result.output or result.status == Status.ERROR:
@@ -605,8 +718,27 @@ class Orchestrator:
                     if task["id"] != init_id:
                         self.state.add_dependency(task["id"], init_id)
             await self._project_stage(Stage.TASK_PLANNING, planning)
+            await self._commit_project_documents()
         else:
             await self._project_stage(Stage.TASK_PLANNING, lambda: self._task_planning(None))
+
+    async def _commit_project_documents(self) -> None:
+        """New projects: the brief, PRD and architecture become their own first commit before any code."""
+        assert self.workspace
+        protected = {self.config.project.default_branch, "main", "master"}
+        try:
+            async with self._serial:
+                sha = await asyncio.to_thread(
+                    self.git.commit_changes, self.workspace, "docs: add project brief, specification and architecture", None, protected,
+                    ["Planning documents produced by the Product Manager and Architect agents before implementation."],
+                )
+        except GitError as exc:
+            self.events.publish("SYSTEM_ERROR", f"could not commit planning documents: {exc}", status="ERROR")
+            return
+        if sha:
+            self.state.add_checkpoint(self.pid, None, sha, self.config.project.development_branch, "planning documents")
+            self.events.publish("CHECKPOINT_CREATED", f"planning documents committed ({sha[:10]})", status="OK", metadata={"commit": sha})
+            await self._push("planning documents")
 
     # ============================================================ task loop
     async def _task_loop(self, max_tasks: int) -> str:
@@ -638,6 +770,11 @@ class Orchestrator:
                     break
                 if await self._plan_more_work():
                     continue
+                if self.config.project.stop_after == "manual":
+                    await self._idle_until_work_or_stop()
+                    if self._stop_requested():
+                        break
+                    continue
                 break
             done, _ = await asyncio.wait(running.values(), return_when=asyncio.FIRST_COMPLETED)
             for finished in done:
@@ -647,11 +784,29 @@ class Orchestrator:
                 exc = finished.exception()
                 if isinstance(exc, StopRun):
                     self.stop_reason = exc.reason
+                    self.stop_status = exc.status
                 elif exc:
                     log.error("task %s crashed: %s", task_id, exc)
+            if self.config.project.stop_after == "task" and self.tasks_completed >= 1 and not self.stop_reason:
+                self.stop_reason = "stop_after=task: a task was completed; start again for the next one"
+                break
         if running:
             await asyncio.gather(*running.values(), return_exceptions=True)
         return self.stop_reason or "no more runnable tasks"
+
+    async def _idle_until_work_or_stop(self, poll_seconds: float = 5.0) -> None:
+        """stop_after=manual: keep the controller alive, waiting for approvals, retries or new work."""
+        self.state.update_project(self.pid, current_stage="IDLE_WAITING_FOR_WORK")
+        self.events.publish("SYSTEM_PAUSED", "no runnable work: waiting for approvals, retries or new requirements (stop_after=manual)", status="IDLE")
+        self.notifier.notify("SYSTEM_PAUSED", "All current work finished - waiting", {"Mode": "runs until you stop it"},
+                             ["Approve requirements, retry blocked tasks or answer questions to give it more work."], dedupe_key=f"idle-{self.run_id}")
+        while not self._stop_requested():
+            self._apply_control_commands()
+            if self.state.runnable_tasks(self.pid, self.owner) or self.tasks.ensure_tasks_for_approved_requirements():
+                self.state.update_project(self.pid, current_stage="TASK_EXECUTION")
+                self.events.publish("SYSTEM_RESUMED", "new work available; continuing", status="RUNNING")
+                return
+            await asyncio.sleep(poll_seconds)
 
     async def _plan_more_work(self) -> bool:
         created = self.tasks.ensure_tasks_for_approved_requirements()
@@ -698,7 +853,11 @@ class Orchestrator:
                 if self._stop_requested():
                     return
                 stage = Stage(task["stage"])
-                outcome = await self._execute_stage(task, stage)
+                try:
+                    outcome = await self._execute_stage(task, stage)
+                except UsageLimitReached as exc:
+                    await self._handle_usage_limit(exc)  # waits (auto-resume) or raises StopRun
+                    continue  # re-run the interrupted stage
                 if outcome.block_reason:
                     self._block(task, outcome.block_reason)
                     return
@@ -840,7 +999,7 @@ class Orchestrator:
         self._refresh_profile()
         try:
             outcome = await handler(task, was_interrupted)
-        except (BudgetExceeded, TurnLimitExceeded, FatalAgentError, StopRun, GitSafetyError):
+        except (BudgetExceeded, TurnLimitExceeded, FatalAgentError, StopRun, GitSafetyError, UsageLimitReached):
             self.state.finish_stage_run(stage_run, "INTERRUPTED", {"reason": "run stopped"})
             raise
         except Exception as exc:
@@ -1381,7 +1540,7 @@ class Orchestrator:
             prefix = KIND_COMMIT_PREFIX.get(task["kind"], "feat")
             message = f"{prefix}: {task['title'][:60].rstrip('.').lower()}"
             async with self._serial:
-                sha = await asyncio.to_thread(self.git.commit_changes, self.workspace, message, task["id"], protected)
+                sha = await asyncio.to_thread(self.git.commit_changes, self.workspace, message, task["id"], protected, self._commit_body(task))
             note = "committed"
             if sha is None:
                 sha = self.git.head_commit(self.workspace)
@@ -1396,4 +1555,21 @@ class Orchestrator:
         evidence["commit"] = sha
         self._save_design(task["id"], validation_evidence=evidence)
         self.events.publish("CHECKPOINT_CREATED", f"#{task['id']} {sha[:10]} on {branch} ({note})", status="OK", task_id=task["id"], metadata={"commit": sha, "branch": branch})
+        await self._push(f"task #{task['id']} checkpoint", task["id"])
         return StageOutcome(S.COMPLETED, f"checkpoint {sha[:10]} ({note})")
+
+    def _commit_body(self, task: dict[str, Any]) -> list[str]:
+        """Commit message paragraphs: what was built, what was fixed on the way, and what was validated."""
+        design = self._design(task)
+        body: list[str] = []
+        if task.get("description"):
+            body.append(task["description"][:600])
+        if design.get("developer_summary"):
+            body.append("Implementation: " + str(design["developer_summary"])[:600])
+        fixed = [i for i in self.state.issues_for_task(task["id"]) if i["status"] == "VERIFIED"]
+        if fixed:
+            body.append("Fixed during review/testing: " + "; ".join(f"[{i['category']}] {i['title']}" for i in fixed[:12])[:1200])
+        criteria = self._criteria(task)
+        if criteria:
+            body.append("Validated acceptance criteria: " + "; ".join(criteria)[:1200])
+        return body

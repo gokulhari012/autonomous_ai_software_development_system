@@ -24,8 +24,14 @@ export default function Overview({ project, events }) {
         <Card title="Failed tasks" value={data.tasks.FAILED || 0} />
         <Card title="Blocked tasks" value={data.tasks.BLOCKED || 0} sub={data.tasks.ON_HOLD ? `${data.tasks.ON_HOLD} awaiting approval` : ""} />
       </div>
-      {data.pending_approvals.length > 0 && (
-        <div className="notice">{data.pending_approvals.length} approval(s) pending - see the Control Panel.</div>
+      {data.attention.map((item, i) => (
+        <div key={i} className={`attention ${item.level === "error" ? "bad" : item.level === "action" ? "warn" : "info"}`}>
+          <strong>{item.title}</strong>{item.detail ? <div className="hint">{item.detail.slice(0, 300)}</div> : null}
+          <div>{item.fix} <a href={item.level === "action" ? "#control" : "#troubleshoot"}>Open</a></div>
+        </div>
+      ))}
+      {data.last_push && (
+        <p className="hint">Last GitHub push: {data.last_push.ok ? "OK" : "FAILED"} ({data.last_push.context}, {data.last_push.at})</p>
       )}
       <div className="grid-2">
         <Section title="Task status">

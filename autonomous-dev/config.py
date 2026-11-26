@@ -46,6 +46,13 @@ def severity_rank(severity: str) -> int:
         return SEVERITIES.index("MEDIUM")
 
 
+REMOTE_URL_RE = re.compile(r"^(https://[A-Za-z0-9.\-]+(:\d+)?/[A-Za-z0-9._\-/]+|git@[A-Za-z0-9.\-]+:[A-Za-z0-9._\-/]+|ssh://git@[A-Za-z0-9.\-]+(:\d+)?/[A-Za-z0-9._\-/]+)$")
+
+
+def valid_remote_url(url: str) -> bool:
+    return bool(REMOTE_URL_RE.match(url)) and ".." not in url
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
     return slug or "project"
@@ -107,6 +114,18 @@ class ProjectConfig(BaseModel):
     require_independent_review: bool = True
     require_acceptance_validation: bool = True
     auto_approve_inferred_requirements: bool = False
+    # GitHub/remote publishing (opt-in). Only the development branch is ever pushed: never main,
+    # never with force. Authentication uses your existing git credentials (credential manager / SSH).
+    git_push_enabled: bool = False
+    git_remote: str = "origin"
+    git_remote_url: str = ""
+    # When a run ends: "task" = after each completed task, "requirements" = when no work is left,
+    # "manual" = keep running (idle when there is no work) until stopped.
+    stop_after: Literal["task", "requirements", "manual"] = "requirements"
+    # Wait for the Claude usage limit to reset and continue automatically instead of stopping.
+    auto_resume_on_limit: bool = False
+    # Free-text project description / instructions given to the Product Manager (any mode).
+    project_notes: str = Field("", max_length=20000)
     python_executable: str | None = None
     source_dirs: list[str] = Field(default_factory=list)
     test_dir: str = "tests"
@@ -127,6 +146,10 @@ class ProjectConfig(BaseModel):
             raise ConfigError("development_branch must differ from the main/default branch.")
         if not re.fullmatch(r"[A-Za-z0-9._/-]+", self.development_branch):
             raise ConfigError("development_branch contains unsupported characters.")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,50}", self.git_remote):
+            raise ConfigError("git_remote must be a simple remote name such as 'origin'.")
+        if self.git_remote_url and not valid_remote_url(self.git_remote_url):
+            raise ConfigError("git_remote_url must look like https://github.com/<owner>/<repo>.git or git@github.com:<owner>/<repo>.git")
         if self.project_mode != "auto" and self.project_mode not in self.supported_modes:
             raise ConfigError(f"project_mode {self.project_mode!r} is not in supported_modes.")
         if not self.project_id:
