@@ -27,11 +27,6 @@ bash autonomous-dev/scripts/setup.sh
 The setup script creates `.venv`, installs `requirements.txt`, installs Playwright Chromium,
 builds the dashboard, creates the sample workspace and runs `python main.py doctor`.
 
-On Windows, Playwright artifact paths under `reports/` can exceed 260 characters when the repository
-lives in a deep folder. Enable long paths (the registry value
-`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1`), or keep the repository
-in a short path such as `C:\autodev`.
-
 ### Claude authentication (required)
 
 The SDK runs its bundled Claude Code CLI, which authenticates in one of two ways:
@@ -258,9 +253,9 @@ concurrently with file reservations. Test runs, scans and commits are serialised
 ## 4. Running the controller's own tests
 
 ```bash
-python -m pytest                       # 92 offline tests: real tools, scripted agents (about 7 minutes)
+python -m pytest                       # 92 tests; real tools, scripted agents (about 6 minutes)
 python -m pytest -m "not slow"         # quick subset
-python -m pytest --run-live -m live    # 3 tests calling the real Claude Agent SDK (uses plan usage / API credit)
+python -m pytest --run-live -m live    # calls the real Claude Agent SDK (uses plan usage / API credit)
 ```
 
 ---
@@ -295,3 +290,18 @@ Not verified here:
   the samples do not build an executable.
 * **A full multi-hour autonomous run with real Claude agents**: not executed during the build.
   Start one with `python main.py run`.
+
+* **New project**:
+`cd autonomous-dev`
+1. Create New Project
+`..\.venv\Scripts\python.exe main.py project add --name "My App" --path C:\code\my-app --mode new`
+2. Run the New project
+`..\.venv\Scripts\python.exe main.py --config config\projects\my-app.json run`
+It will create "my-app/requirements/brief.md" 
+need to answer that questions.
+3. Again run
+`..\.venv\Scripts\python.exe main.py --config config\projects\my-app.json run`
+If any doubts it will create It will create "my-app/requirements/open_questions.md" 
+need to answer that questions.
+4. Again run
+`..\.venv\Scripts\python.exe main.py --config config\projects\my-app.json run`

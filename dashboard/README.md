@@ -9,6 +9,7 @@ single source of truth.
 ```powershell
 cd dashboard
 ..\.venv\Scripts\python.exe -m backend.manage set-password     # once; writes a bcrypt hash to dashboard/.env
+#Password: adminadmin
 cd frontend; npm install; npm run build; cd ..                 # once (or after frontend changes)
 ..\.venv\Scripts\python.exe -m backend.app                     # http://127.0.0.1:8000
 ```

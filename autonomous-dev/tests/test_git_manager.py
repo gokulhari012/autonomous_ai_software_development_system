@@ -74,6 +74,24 @@ def test_unversioned_project_requires_authorization(tmp_path, state):
     assert any("Backed up" in n for n in info.notes)
 
 
+def test_new_project_inside_a_parent_repo_gets_its_own_repo(tmp_path, state, user_repo):
+    nested = user_repo / "sample-workspace" / "cal-app"  # folder inside another repository
+    gm = _manager(tmp_path, state)
+    info = gm.prepare_workspace(nested, "autonomous-development", "main", "worktree", tmp_path / "wt", "new", False, tmp_path / "b")
+    assert info.workspace_path == nested and (nested / ".git").exists()
+    assert gm.repo_root(nested).resolve() == nested.resolve()
+    assert gm.current_branch(user_repo) == "main"  # the parent repository is untouched
+
+
+def test_existing_project_inside_a_parent_repo_is_refused(tmp_path, state, user_repo):
+    sub = user_repo / "pkg"
+    sub.mkdir()
+    (sub / "m.py").write_text("x = 1\n", encoding="utf-8")
+    gm = _manager(tmp_path, state)
+    with pytest.raises(GitSafetyError, match="sub-folder of another Git repository"):
+        gm.prepare_workspace(sub, "autonomous-development", "main", "worktree", tmp_path / "wt", "existing", False, tmp_path / "b")
+
+
 def test_branch_mode_refuses_dirty_tree(tmp_path, state, user_repo):
     (user_repo / "app.py").write_text("changed\n", encoding="utf-8")
     gm = _manager(tmp_path, state)

@@ -38,7 +38,8 @@ NEVER_ALLOWED = {
     "SendMessage", "Monitor", "ScheduleWakeup",
 }
 SECRET_NAME_PATTERNS = [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "credentials*.json", "*.pfx", "*.p12", ".netrc", ".pypirc"]
-PROTECTED_WRITE_GLOBS = [".git", ".git/**", "**/.git/**", ".env", "**/.env", ".env.*", "**/.env.*", ".autodev/**"]
+ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template"}
+PROTECTED_WRITE_GLOBS =[".git", ".git/**", "**/.git/**", ".env", "**/.env", ".env.*", "**/.env.*", ".autodev/**"]
 SHELL_METACHARACTERS = re.compile(r"[;&|<>`]|\$\(|\$\{|\r|\n")
 
 AGENT_POLICIES_DEFAULT_BASH: dict[str, list[list[str]]] = {
@@ -63,7 +64,7 @@ class AgentPolicy:
 
 def _is_secret_name(name: str) -> bool:
     lower = name.lower()
-    return any(fnmatch.fnmatch(lower, pattern) for pattern in SECRET_NAME_PATTERNS) and lower not in {".env.example", ".env.sample", ".env.template"}
+    return any(fnmatch.fnmatch(lower, pattern) for pattern in SECRET_NAME_PATTERNS) and lower not in ENV_TEMPLATE_NAMES
 
 
 def _glob_match(rel_posix: str, pattern: str) -> bool:
@@ -168,7 +169,8 @@ class ToolGuard:
             return False, f"writing outside the project workspace is denied ({value})"
         if _is_secret_name(path.name):
             return False, f"writing secret file {path.name} is denied"
-        if any(_glob_match(rel, g) for g in PROTECTED_WRITE_GLOBS):
+        # Template files such as .env.example hold no secrets and are normal deliverables.
+        if path.name.lower() not in ENV_TEMPLATE_NAMES and any(_glob_match(rel, g) for g in PROTECTED_WRITE_GLOBS):
             return False, f"{rel} is a protected path"
         if not self.write_scope:
             return False, f"agent {self.policy.name} has read-only access to application files"

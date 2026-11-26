@@ -72,6 +72,12 @@ class GitManager:
         result = self.run(["rev-parse", "--is-inside-work-tree"], path, check=False)
         return result.ok and result.stdout.strip() == "true"
 
+    def is_own_repo(self, path: Path) -> bool:
+        """True only if ``path`` is the root of its own repository (not merely inside a parent repo)."""
+        if not self.is_repo(path):
+            return False
+        return self.repo_root(path).resolve() == path.resolve()
+
     def repo_root(self, path: Path) -> Path:
         return Path(self.run(["rev-parse", "--show-toplevel"], path).stdout.strip())
 
@@ -249,8 +255,13 @@ class GitManager:
             project_dir.mkdir(parents=True)
             notes.append(f"Created new project directory {project_dir}.")
 
-        if not self.is_repo(project_dir):
+        if not self.is_own_repo(project_dir):
             visible = [p for p in project_dir.iterdir() if p.name not in {".DS_Store"}]
+            if mode != "new" and self.is_repo(project_dir):
+                raise GitSafetyError(
+                    f"{project_dir} is a sub-folder of another Git repository ({self.repo_root(project_dir)}). "
+                    "Point the project at the repository root, or move the project into its own folder."
+                )
             if visible and not (mode == "new" or allow_git_init):
                 raise GitSafetyError(
                     f"{project_dir} contains files but is not a Git repository. The controller will not modify "

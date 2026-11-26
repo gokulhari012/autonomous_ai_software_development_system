@@ -122,6 +122,14 @@ def test_protected_paths(workspace):
     assert guard.check("Write", {"file_path": str(workspace / "app" / "new.py")})[0]
 
 
+def test_env_template_writable_but_real_env_files_are_not(workspace):
+    guard = ToolGuard(AgentPolicy("developer", ["Write"]), workspace, ["**"])
+    assert guard.check("Write", {"file_path": str(workspace / ".env.example")})[0]
+    assert guard.check("Write", {"file_path": str(workspace / "app" / ".env.sample")})[0]
+    for name in (".env", ".env.local", ".env.production"):
+        assert not guard.check("Write", {"file_path": str(workspace / name)})[0], name
+
+
 def test_hook_returns_deny_decision(workspace):
     guard = ToolGuard(AgentPolicy("code_reviewer", ["Read"]), workspace, [])
     out = asyncio.run(guard.pre_tool_use_hook({"tool_name": "Write", "tool_input": {"file_path": "x.py"}}, "id1", None))
