@@ -1,0 +1,36 @@
+{
+  "project_name": "Flask Inventory Sample",
+  "project_path": "../sample-workspace/flask-inventory",
+  "project_mode": "auto",
+  "supported_modes": ["new", "existing"],
+  "require_project_discovery": true,
+  "require_architecture_design": true,
+  "require_acceptance_criteria": true,
+  "application_types": ["flask", "pyside"],
+  "default_branch": "main",
+  "development_branch": "autonomous-development",
+  "git_isolation": "worktree",
+  "allow_git_init": false,
+  "staging_environment": "local",
+  "deployment_method": "auto",
+  "max_retries_per_task": 3,
+  "max_parallel_agents": 2,
+  "max_parallel_tasks": 1,
+  "max_tasks_per_run": 100,
+  "production_deployment": false,
+  "require_git_checkpoint": true,
+  "require_independent_review": true,
+  "require_acceptance_validation": true,
+  "auto_approve_inferred_requirements": false,
+  "test_dir": "tests",
+  "project_brief": "requirements/brief.md",
+  "flask": {
+    "health_path": "/health",
+    "staging_port": 5055,
+    "qa_port": 5056,
+    "database_env_var": "DATABASE_URL"
+  },
+  "pyside": {
+    "startup_seconds": 6
+  }
+}

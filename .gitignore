@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Secrets - never commit
+.env
+*.env.local
+dashboard/backend/.dashboard_secret
+
+# Autonomous controller runtime state
+autonomous-dev/database/*.db
+autonomous-dev/database/*.db-wal
+autonomous-dev/database/*.db-shm
+autonomous-dev/logs/*
+!autonomous-dev/logs/.gitkeep
+autonomous-dev/reports/*
+!autonomous-dev/reports/reviews/
+!autonomous-dev/reports/tests/
+!autonomous-dev/reports/security/
+!autonomous-dev/reports/releases/
+autonomous-dev/reports/*/*
+!autonomous-dev/reports/*/.gitkeep
+autonomous-dev/workspaces/
+autonomous-dev/backups/
+sample-workspace/
+autonomous-dev/config/projects/*.json
+!autonomous-dev/config/projects/.gitkeep
+
+# Dashboard frontend
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

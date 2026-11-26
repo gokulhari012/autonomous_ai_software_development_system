@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<form method="post" action="{{ action }}" novalidate>
+  {% for field, label in [("sku", "SKU"), ("name", "Name"), ("quantity", "Quantity"), ("price_cents", "Price (cents)")] %}
+    <p>
+      <label for="{{ field }}">{{ label }}</label>
+      <input id="{{ field }}" name="{{ field }}" value="{{ form[field] }}">
+      {% if errors.get(field) %}<span class="error" role="alert">{{ label }} {{ errors[field] }}</span>{% endif %}
+    </p>
+  {% endfor %}
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

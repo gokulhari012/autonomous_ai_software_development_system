@@ -1,0 +1,25 @@
+{
+  "block_severity_threshold": "HIGH",
+  "auditor_may_dismiss_severities": ["INFO", "LOW", "MEDIUM"],
+  "scanner_failure_policy": {
+    "bandit": "block",
+    "semgrep": "block",
+    "pip_audit": "warn"
+  },
+  "block_preexisting_critical": true,
+  "exceptions_file": "config/security_exceptions.json",
+  "bandit": {
+    "exclude_dirs": ["tests", ".venv", "venv", "node_modules", "build", "dist"],
+    "timeout_seconds": 600
+  },
+  "semgrep": {
+    "registry_configs": ["p/python", "p/flask", "p/security-audit", "p/secrets"],
+    "use_registry": true,
+    "local_rules": "config/semgrep/local-rules.yml",
+    "timeout_seconds": 900
+  },
+  "pip_audit": {
+    "timeout_seconds": 900,
+    "vulnerability_severity": "HIGH"
+  }
+}

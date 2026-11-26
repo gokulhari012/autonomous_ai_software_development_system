@@ -1,0 +1,123 @@
+# Local Semgrep rules used in addition to (or, when the registry is unreachable,
+# instead of) the maintained registry rulesets p/python, p/flask, p/security-audit
+# and p/secrets. They need no network access and no Semgrep login.
+rules:
+  - id: autodev-sql-injection-string-built-query
+    languages: [python]
+    severity: ERROR
+    message: SQL built with string formatting or concatenation is passed to execute(). Use parameterised queries (placeholders + parameters).
+    metadata: {category: security, cwe: "CWE-89: SQL Injection", confidence: HIGH, impact: HIGH}
+    pattern-either:
+      - pattern: $CUR.execute(f"...", ...)
+      - pattern: $CUR.execute("..." % $X, ...)
+      - pattern: $CUR.execute("..." + $X, ...)
+      - pattern: $CUR.execute($X + "...", ...)
+      - pattern: $CUR.execute("...".format(...), ...)
+      - pattern: $CUR.executemany(f"...", ...)
+      - pattern: |
+          $Q = f"..."
+          ...
+          $CUR.execute($Q, ...)
+      - pattern: |
+          $Q = "..." + $X
+          ...
+          $CUR.execute($Q, ...)
+      - pattern: |
+          $Q = "..." % $X
+          ...
+          $CUR.execute($Q, ...)
+
+  - id: autodev-command-injection-shell
+    languages: [python]
+    severity: ERROR
+    message: Command executed through a shell. Pass an argument list without shell=True and never interpolate user input into commands.
+    metadata: {category: security, cwe: "CWE-78: OS Command Injection", confidence: MEDIUM, impact: HIGH}
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: autodev-insecure-deserialization
+    languages: [python]
+    severity: ERROR
+    message: Deserialising untrusted data with pickle/marshal or yaml.load without SafeLoader can execute arbitrary code.
+    metadata: {category: security, cwe: "CWE-502: Deserialization of Untrusted Data", confidence: MEDIUM, impact: HIGH}
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+      - pattern: marshal.loads(...)
+      - patterns:
+          - pattern: yaml.load(...)
+          - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+          - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+
+  - id: autodev-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: eval()/exec() on dynamic input allows code injection.
+    metadata: {category: security, cwe: "CWE-95: Eval Injection", confidence: MEDIUM, impact: HIGH}
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: exec($X)
+      - pattern-not: eval("...")
+      - pattern-not: exec("...")
+
+  - id: autodev-flask-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: Flask debug mode exposes the Werkzeug debugger (remote code execution). Never enable it outside local development.
+    metadata: {category: security, cwe: "CWE-489: Active Debug Code", confidence: HIGH, impact: MEDIUM}
+    pattern: $APP.run(..., debug=True, ...)
+
+  - id: autodev-hardcoded-secret
+    languages: [python]
+    severity: ERROR
+    message: Hardcoded credential. Load secrets from environment variables or a secret store.
+    metadata: {category: security, cwe: "CWE-798: Use of Hard-coded Credentials", confidence: MEDIUM, impact: HIGH}
+    pattern-either:
+      - patterns:
+          - pattern: $NAME = "$VALUE"
+          - metavariable-regex:
+              metavariable: $NAME
+              regex: (?i)^.*(password|passwd|secret|api_?key|access_?token|auth_?token|private_?key)$
+          - metavariable-regex:
+              metavariable: $VALUE
+              regex: ^[^\s{}$]{8,}$
+      - pattern: $APP.config["SECRET_KEY"] = "..."
+      - pattern: $APP.secret_key = "..."
+
+  - id: autodev-unsafe-upload-filename
+    languages: [python]
+    severity: WARNING
+    message: Uploaded file saved with the client-supplied filename. Use werkzeug.utils.secure_filename and validate the extension.
+    metadata: {category: security, cwe: "CWE-22: Path Traversal", confidence: MEDIUM, impact: HIGH}
+    patterns:
+      - pattern: $F.save(..., $F.filename, ...)
+      - pattern-not-inside: $F.save(..., secure_filename($F.filename), ...)
+
+  - id: autodev-render-template-string-dynamic
+    languages: [python]
+    severity: WARNING
+    message: render_template_string() with dynamic content can lead to server-side template injection.
+    metadata: {category: security, cwe: "CWE-1336: Template Injection", confidence: LOW, impact: HIGH}
+    patterns:
+      - pattern: render_template_string($X, ...)
+      - pattern-not: render_template_string("...", ...)
+
+  - id: autodev-tls-verification-disabled
+    languages: [python]
+    severity: WARNING
+    message: TLS certificate verification disabled.
+    metadata: {category: security, cwe: "CWE-295: Improper Certificate Validation", confidence: HIGH, impact: MEDIUM}
+    pattern-either:
+      - pattern: requests.$M(..., verify=False, ...)
+      - pattern: httpx.$M(..., verify=False, ...)
+
+  - id: autodev-jwt-signature-not-verified
+    languages: [python]
+    severity: ERROR
+    message: JWT decoded without signature verification.
+    metadata: {category: security, cwe: "CWE-347: Improper Verification of Cryptographic Signature", confidence: HIGH, impact: HIGH}
+    pattern: |
+      jwt.decode(..., options={..., "verify_signature": False, ...}, ...)

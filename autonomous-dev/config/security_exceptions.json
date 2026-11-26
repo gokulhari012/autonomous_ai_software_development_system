@@ -1,0 +1,4 @@
+{
+  "_comment": "Human-approved security exceptions. Each entry must name the finding fingerprint, the reviewer and the reason. The controller never adds entries here itself.",
+  "exceptions": []
+}

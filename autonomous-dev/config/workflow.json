@@ -1,0 +1,33 @@
+{
+  "model": "claude-opus-5-5",
+  "fallback_model": "claude-sonnet-5-5",
+  "default_effort": "medium",
+  "default_max_turns": 40,
+  "max_agent_turns_per_task": 400,
+  "agent_timeout_seconds": 1800,
+  "max_execution_minutes": 480,
+  "max_budget_usd": 25.0,
+  "max_budget_usd_per_agent_call": 4.0,
+  "transient_retry_attempts": 3,
+  "backoff_base_seconds": 5,
+  "backoff_max_seconds": 120,
+  "max_invalid_output_retries": 1,
+  "max_stage_errors": 2,
+  "lease_seconds": 1200,
+  "heartbeat_seconds": 30,
+  "review_after_fix": true,
+  "qa_test_fix_attempts": 1,
+  "events_retention_days": 30,
+  "notification_dedupe_seconds": 600,
+  "agents": {
+    "product_manager": {"effort": "medium", "max_turns": 30},
+    "architect": {"effort": "high", "max_turns": 30},
+    "developer": {"effort": "high", "max_turns": 80},
+    "code_reviewer": {"effort": "high", "max_turns": 30},
+    "qa_engineer": {"effort": "medium", "max_turns": 60},
+    "security_auditor": {"effort": "high", "max_turns": 30},
+    "bug_fixer": {"effort": "high", "max_turns": 60},
+    "devops_engineer": {"effort": "medium", "max_turns": 25},
+    "product_validator": {"effort": "high", "max_turns": 50}
+  }
+}

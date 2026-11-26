@@ -1,0 +1,32 @@
+{
+  "python": {
+    "enabled": true,
+    "framework": "pytest",
+    "timeout_seconds": 900,
+    "per_test_timeout_seconds": 120
+  },
+  "flask": {
+    "api_testing": true,
+    "database_testing": true,
+    "integration_testing": true,
+    "playwright": true,
+    "browsers": ["chromium"]
+  },
+  "pyside": {
+    "enabled": true,
+    "pytest_qt": true,
+    "pyautogui": true,
+    "packaged_application_testing": true,
+    "offscreen_widget_tests": true
+  },
+  "security": {
+    "bandit": true,
+    "semgrep": true,
+    "pip_audit": true
+  },
+  "reports": {
+    "json": true,
+    "junit_xml": true,
+    "screenshots": true
+  }
+}

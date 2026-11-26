@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Items{% endblock %}
+{% block content %}
+<h1>Inventory items</h1>
+<form method="get" role="search">
+  <label for="q">Search</label>
+  <input id="q" name="q" value="{{ search }}">
+  <button type="submit">Search</button>
+</form>
+<p>{{ total }} item(s)</p>
+<table aria-label="Items">
+  <thead><tr><th>SKU</th><th>Name</th><th>Quantity</th><th>Price</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for item in items %}
+    <tr data-testid="item-row">
+      <td>{{ item.sku }}</td>
+      <td>{{ item.name }}</td>
+      <td>{{ item.quantity }}</td>
+      <td>{{ "%.2f"|format(item.price_cents / 100) }}</td>
+      <td>
+        <a href="{{ url_for('views.edit_item', item_id=item.id) }}">Edit {{ item.name }}</a>
+        <form class="inline" method="post" action="{{ url_for('views.delete_item', item_id=item.id) }}">
+          <button type="submit" aria-label="Delete {{ item.name }}">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5">No items found.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<nav aria-label="Pagination">
+  {% if page > 1 %}<a href="{{ url_for('views.index', page=page - 1, q=search) }}">Previous</a>{% endif %}
+  <span>Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a href="{{ url_for('views.index', page=page + 1, q=search) }}">Next</a>{% endif %}
+</nav>
+{% endblock %}

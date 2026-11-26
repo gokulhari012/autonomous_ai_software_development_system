@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Inventory{% endblock %}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 900px; padding: 0 1rem; }
+    nav a { margin-right: 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #ddd; padding: .4rem; text-align: left; }
+    .error { color: #b00020; }
+    .flash { background: #e7f5e7; padding: .5rem; }
+    form.inline { display: inline; }
+  </style>
+</head>
+<body>
+  <nav aria-label="Main">
+    <a href="{{ url_for('views.index') }}">Items</a>
+    <a href="{{ url_for('views.new_item') }}">New item</a>
+  </nav>
+  {% for message in get_flashed_messages() %}
+    <p class="flash" role="status">{{ message }}</p>
+  {% endfor %}
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>
