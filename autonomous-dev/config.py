@@ -68,6 +68,9 @@ class FlaskAppConfig(BaseModel):
     app: str | None = None
     health_path: str = "/health"
     staging_host: str = "127.0.0.1"
+    # Opt-in: let other devices on the local network (e.g. a phone) open the staging app. The staging
+    # server then listens on all interfaces; browser tests and health checks still use 127.0.0.1.
+    lan_access: bool = False
     staging_port: int = 5055
     qa_port: int = 5056
     startup_timeout_seconds: int = 45

@@ -191,6 +191,26 @@ def test_flask_staging_healthy_and_broken(tmp_path):
     assert not broken.ok and "boom during startup" in broken.detail.get("log_tail", "")
 
 
+@pytest.mark.parametrize(
+    "lan_access,purpose,bind_host",
+    [(False, "staging", "127.0.0.1"), (True, "staging", "0.0.0.0"), (True, "qa", "127.0.0.1")],
+)
+def test_staging_is_shared_on_the_network_only_when_enabled(tmp_path, monkeypatch, lan_access, purpose, bind_host):
+    project = copy_sample("flask-inventory", tmp_path)
+    cfg, state, events, executor, profile = _components(tmp_path, project, flask={"staging_port": 5189, "qa_port": 5190, "lan_access": lan_access})
+    commands: list[list[str]] = []
+
+    def spawn(argv, *args, **kwargs):  # capture the command; nothing is started or opened
+        commands.append(argv)
+        raise RuntimeError("not started in this test")
+
+    monkeypatch.setattr(executor, "spawn", spawn)
+    result = asyncio.run(DeploymentManager(cfg, state, events, executor, profile).deploy_flask(project, None, purpose=purpose))
+    argv = commands[0]
+    assert argv[argv.index("--host") + 1] == bind_host
+    assert result.url.startswith("http://127.0.0.1:")  # tests and health checks always stay local
+
+
 @pytest.mark.slow
 def test_pyside_desktop_launch_offscreen(tmp_path):
     project = copy_sample("pyside-notes", tmp_path)
@@ -275,6 +295,31 @@ def test_bot_authorization_and_commands(tmp_path):
     assert len(fake.messages) == 2  # no reply to the unauthorised user
     assert any(a["action"] == "unauthorized_command" for a in state.recent_audit(10))
     assert state.kv_get(f"telegram_offset:{cfg.project_id}") == "4"
+
+
+def test_getip_replies_with_the_laptop_address_to_authorised_users_only(tmp_path, monkeypatch):
+    cfg = _telegram_config(tmp_path)
+    state = StateManager(cfg.db_path)
+    fake = FakeTelegram()
+    bot = TelegramCommandBot(cfg, state, client_factory=fake.factory())
+    monkeypatch.setattr("telegram_bot.lan_addresses", lambda: [("192.168.1.20", "Wi-Fi"), ("10.8.0.2", "VPN")])
+    fake.updates = [
+        {"update_id": 1, "message": {"text": "/getip", "chat": {"id": 1001}, "from": {"id": 999}}},
+        {"update_id": 2, "message": {"text": "/getip", "chat": {"id": 1001}, "from": {"id": 42}}},
+    ]
+
+    async def poll():
+        async with fake.factory()() as client:
+            return await bot.poll_once(client, timeout=0)
+
+    asyncio.run(poll())
+    assert len(fake.messages) == 1
+    text = fake.messages[0]["text"]
+    assert "Laptop IP: 192.168.1.20" in text and "10.8.0.2 (VPN)" in text and "network access is off" in text
+    cfg.project.flask.lan_access = True
+    assert f"http://192.168.1.20:{cfg.project.flask.staging_port}" in bot.handle_command("/getip", "42")
+    monkeypatch.setattr("telegram_bot.lan_addresses", lambda: [])
+    assert "No network connection" in bot.handle_command("/getip", "42")
 
 
 def test_format_message_truncates():

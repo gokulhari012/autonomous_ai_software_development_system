@@ -10,7 +10,8 @@
   When a packaging command is configured, the executable is built and launched too.
 
 Production deployment is not implemented on purpose: the configuration refuses
-``production_deployment: true`` and no code path targets anything but localhost.
+``production_deployment: true``. Staging listens on localhost only, unless the
+project opts in to ``flask.lan_access`` so devices on the local network can open it.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import psutil
 
 from config import REPORTS_DIR, AppConfig
 from events import EventBus
+from net_utils import lan_ip
 from project_inspector import ProjectProfile, gui_session_available
 from safe_exec import SafeExecutor, find_executable, kill_process_tree
 from state_manager import StateManager
@@ -104,6 +106,11 @@ class DeploymentManager:
         if host not in ("127.0.0.1", "localhost"):
             return DeploymentResult("FAILED", method, error="staging must bind to localhost")
         url = f"http://{host}:{port}"
+        # Only the staging server is ever shared on the network, never the temporary QA server.
+        shared = flask_cfg.lan_access and purpose == "staging"
+        bind_host = "0.0.0.0" if shared else host
+        address = lan_ip() if shared else None
+        remote_url = f"http://{address}:{port}" if address else None
         staging_dir = self._staging_dir(purpose)
         log_path = staging_dir / "startup.log"
         self.events.publish("DEPLOYMENT_STARTED", f"{purpose} deployment starting ({method}) at {url}", status="IN_PROGRESS", task_id=task_id, metadata={"method": method, "purpose": purpose})
@@ -123,15 +130,18 @@ class DeploymentManager:
             "PYTHONPATH": str(workspace),
         }
         if method == "docker-compose":
-            return await self._deploy_compose(workspace, task_id, url, staging_dir, log_path, env)
+            result = await self._deploy_compose(workspace, task_id, url, staging_dir, log_path, env)
+            if result.ok and remote_url:  # the compose file decides which interfaces the port is published on
+                result.detail["remote_url"] = remote_url
+            return result
 
         app_spec = flask_cfg.app or self.profile.flask_app
         if not app_spec and not flask_cfg.start_command:
             return self._failed(task_id, method, url, log_path, "could not determine the Flask application (set flask.app in project.json)")
         if flask_cfg.start_command:
-            argv = [a.format(python=self.python, port=port, host=host) for a in flask_cfg.start_command]
+            argv = [a.format(python=self.python, port=port, host=bind_host) for a in flask_cfg.start_command]
         else:
-            argv = [self.python, "-m", "flask", "--app", app_spec, "run", "--host", host, "--port", str(port), "--no-reload", "--no-debugger"]
+            argv = [self.python, "-m", "flask", "--app", app_spec, "run", "--host", bind_host, "--port", str(port), "--no-reload", "--no-debugger"]
         try:
             proc = self.executor.spawn(argv, workspace, log_path, env)
         except Exception as exc:
@@ -145,8 +155,11 @@ class DeploymentManager:
         health = await self._wait_healthy(url + flask_cfg.health_path, proc, flask_cfg.startup_timeout_seconds)
         detail = {"health": health, "env_vars": sorted(env), "staging_db": str(staging_dir / "staging.db")}
         if health["ok"]:
+            if remote_url:
+                detail["remote_url"] = remote_url
             self.state.update_deployment(deployment_id, status="HEALTHY", health_status=json.dumps(health)[:1000], detail=detail)
-            self.events.publish("DEPLOYMENT_COMPLETED", f"{purpose} deployment healthy at {url}", status="PASS", task_id=task_id, metadata={"deployment_id": deployment_id, **health})
+            shared_text = f" (on the local network: {remote_url})" if remote_url else ""
+            self.events.publish("DEPLOYMENT_COMPLETED", f"{purpose} deployment healthy at {url}{shared_text}", status="PASS", task_id=task_id, metadata={"deployment_id": deployment_id, **health})
             return DeploymentResult("HEALTHY", method, deployment_id, url, str(log_path), detail)
         self.stop(deployment_id)
         self.state.update_deployment(deployment_id, status="FAILED", health_status=json.dumps(health)[:1000], detail={**detail, "log_tail": tail(log_path, 40)})

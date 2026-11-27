@@ -1,6 +1,6 @@
 """Telegram command bot (long polling ``getUpdates``).
 
-Supported commands: /status /tasks /agents /logs /report /pause /resume /stop /help
+Supported commands: /status /tasks /agents /logs /report /getip /pause /resume /stop /help
 
 Security:
 * a command is accepted only when it comes from the configured chat
@@ -24,6 +24,7 @@ import httpx
 
 from config import LOGS_DIR, AppConfig
 from logging_setup import redact, tail_log
+from net_utils import lan_addresses
 from state_manager import StateManager
 from status_reports import agents_summary, latest_report, overall_status, tasks_summary
 
@@ -31,7 +32,7 @@ log = logging.getLogger("telegram_bot")
 
 HELP = (
     "/status - overall project status\n/tasks - pending and completed tasks\n/agents - agent activity\n"
-    "/logs - recent logs\n/report - latest project report\n/pause - pause new task scheduling\n"
+    "/logs - recent logs\n/report - latest project report\n/getip - laptop IP address\n/pause - pause new task scheduling\n"
     "/resume - resume execution\n/stop - safely stop new task execution"
 )
 
@@ -57,6 +58,21 @@ class TelegramCommandBot:
             return False
         return chat_id == str(self.secrets.telegram_chat_id) and user_id in self.secrets.telegram_authorized_user_ids
 
+    def ip_summary(self) -> str:
+        addresses = lan_addresses()
+        if not addresses:
+            return "No network connection found on the laptop."
+        ip = addresses[0][0]
+        lines = [f"Laptop IP: {ip}"]
+        if len(addresses) > 1:
+            lines.append("Other adapters: " + ", ".join(f"{other} ({name})" for other, name in addresses[1:6]))
+        flask_cfg = self.config.project.flask
+        if flask_cfg.lan_access:
+            lines.append(f"Staging remote URL: http://{ip}:{flask_cfg.staging_port} (works while the staging app is running)")
+        else:
+            lines.append("Staging network access is off for this project (enable it in the project settings).")
+        return "\n".join(lines)
+
     def handle_command(self, text: str, user_id: str) -> str:
         command = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
         pid = self.project_id
@@ -71,6 +87,8 @@ class TelegramCommandBot:
         if command == "/logs":
             lines = [l for l in tail_log(LOGS_DIR, 60) if " DEBUG " not in l][-25:]
             return "\n".join(l[:220] for l in lines) or "No log lines yet."
+        if command == "/getip":
+            return self.ip_summary()
         if command == "/report":
             _, summary = latest_report(pid)
             return summary

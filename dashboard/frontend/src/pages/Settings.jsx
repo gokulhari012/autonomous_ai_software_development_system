@@ -13,6 +13,7 @@ const PROJECT_FIELDS = [
   ["max_retries_per_task", "Repair attempts per task before it is blocked", "int"],
   ["max_parallel_tasks", "Tasks in parallel (1 is safest)", "int"],
   ["auto_approve_inferred_requirements", "Auto-approve requirements the agents infer (otherwise you approve them)", "bool"],
+  ["flask.lan_access", "Let other devices on my network (e.g. phone) open the staging app - anyone on the same network can reach it", "bool"],
   ["flask.staging_port", "Flask staging port", "int"],
   ["flask.qa_port", "Flask browser-test port", "int"],
   ["flask.health_path", "Flask health endpoint", "text"],

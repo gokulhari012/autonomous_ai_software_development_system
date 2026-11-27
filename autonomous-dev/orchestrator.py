@@ -1422,8 +1422,16 @@ class Orchestrator:
             result = await self.deployer.deploy_desktop(self.workspace, task["id"])
         else:
             result = await self.deployer.deploy_flask(self.workspace, task["id"], purpose="staging")
-        self.notifier.notify("STAGING_DEPLOYMENT", "Staging Deployment", {"Task": task["title"], "Method": result.method, "Status": "PASS" if result.ok else "FAIL", "URL": result.url or "-"},
-                             [result.error] if result.error else None, dedupe_key=f"staging-{task['id']}-{result.deployment_id}")
+        fields = {"Task": task["title"], "Method": result.method, "Status": "PASS" if result.ok else "FAIL", "URL": result.url or "-"}
+        footer = None
+        if result.ok and result.url:
+            if self.config.project.flask.lan_access:
+                fields["Remote URL"] = result.detail.get("remote_url") or "not available (no network connection found)"
+            else:
+                fields["Remote URL"] = "off (enable network access in the project settings)"
+            footer = "The staging app runs only while this task is tested and validated, then it is stopped."
+        self.notifier.notify("STAGING_DEPLOYMENT", "Staging Deployment", fields,
+                             [result.error] if result.error else None, footer=footer, dedupe_key=f"staging-{task['id']}-{result.deployment_id}")
         if not result.ok:
             return await self._handle_staging_failure(task, result)
         self._save_design(task["id"], staging={"deployment_id": result.deployment_id, "url": result.url, "method": result.method, "detail": {k: v for k, v in result.detail.items() if k != "log_tail"}})

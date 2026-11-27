@@ -81,6 +81,7 @@ PROJECT_FIELDS: dict[str, Callable[[Any], Any]] = {
     "max_parallel_tasks": _int(1, 4),
     "auto_approve_inferred_requirements": _bool,
     "application_types": _app_types,
+    "flask.lan_access": _bool,
     "flask.staging_port": _int(1024, 65535),
     "flask.qa_port": _int(1024, 65535),
     "flask.health_path": _text(100, re.compile(r"^/[A-Za-z0-9/_\-.]*$"), allow_empty=False),
@@ -107,7 +108,7 @@ WORKFLOW_FIELDS: dict[str, Callable[[Any], Any]] = {
 PROJECT_DEFAULTS: dict[str, Any] = {
     "project_notes": "", "git_push_enabled": False, "git_remote": "origin", "git_remote_url": "", "stop_after": "requirements",
     "auto_resume_on_limit": False, "max_retries_per_task": 3, "max_tasks_per_run": 100, "max_parallel_tasks": 1,
-    "auto_approve_inferred_requirements": False, "application_types": [], "flask.staging_port": 5055, "flask.qa_port": 5056,
+    "auto_approve_inferred_requirements": False, "application_types": [], "flask.lan_access": False, "flask.staging_port": 5055, "flask.qa_port": 5056,
     "flask.health_path": "/health", "pyside.startup_seconds": 6,
 }
 

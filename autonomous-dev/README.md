@@ -98,7 +98,21 @@ python main.py --config config/projects/my-app.json run
 
 The same controls exist in Telegram (`/status /tasks /agents /logs /report /pause /resume /stop`)
 and in the dashboard. All of them write persistent flags or commands, which the running
-orchestrator applies at its next safe point.
+orchestrator applies at its next safe point. Telegram also has `/getip`, which replies with the
+laptop's IP address. The bot answers only authorised users, while the controller runs with
+`--with-telegram-bot` (or while `telegram-bot` runs).
+
+### Opening the staging app from another device
+
+Staging listens on `127.0.0.1` only. To open it from a phone or another computer on the same
+network, enable **Let other devices on my network open the staging app** in the project settings
+(`"flask": {"lan_access": true}`). The staging server then listens on all network interfaces, and
+the Telegram staging message includes `Remote URL: http://<laptop-ip>:<staging port>`.
+
+* Anyone on the same network can open it, so leave it off on public or shared Wi-Fi.
+* Windows Firewall must allow incoming connections to Python on private networks.
+* The staging app runs only while a task is being staged and validated, then it is stopped.
+* It does not work from outside your network. Do not forward the port on your router.
 
 ### Everything from the dashboard
 
