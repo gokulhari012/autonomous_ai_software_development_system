@@ -55,6 +55,50 @@ AUTH_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "AWS_", "GOOGLE_", "CLOUD_ML_", "A
 SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "CREDENTIAL", "PRIVATE_KEY")
 RETRYABLE_HTTP = {408, 409, 429, 500, 502, 503, 504, 529}
 
+# Text the Claude CLI prints when a plan limit is hit, e.g.
+# "You've hit your 5-hour limit · resets 1:50am (Asia/Kolkata)". The CLI then exits with code 1,
+# so the SDK raises ProcessError and the ResultMessage is never seen.
+USAGE_LIMIT_RE = re.compile(
+    r"\b(?:hit|reached|exceeded)\s+your\s+[^.\n]{0,40}?\blimit\b|\busage\s+limit\b|\b(?:5|five)-hour\s+limit\b|\bweekly\s+limit\b",
+    re.I,
+)
+RESET_TIME_RE = re.compile(r"\bresets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*\(([A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+){0,2})\))?", re.I)
+
+
+def is_usage_limit_text(text: str | None) -> bool:
+    return bool(text and USAGE_LIMIT_RE.search(text))
+
+
+def parse_reset_time(text: str | None, now: float | None = None) -> float | None:
+    """Unix timestamp of the next "resets 1:50am (Asia/Kolkata)" time in ``text``; None if absent.
+
+    Falls back to the computer's local time zone when the named zone is unknown (no tzdata)."""
+    match = RESET_TIME_RE.search(text or "")
+    if not match:
+        return None
+    import datetime as dt
+
+    hour, minute, ampm, zone_name = int(match.group(1)), int(match.group(2) or 0), (match.group(3) or "").lower(), match.group(4)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    tz = None
+    if zone_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(zone_name)
+        except Exception:
+            tz = None
+    current = dt.datetime.fromtimestamp(now if now is not None else time.time(), tz=tz).astimezone(tz) if tz else dt.datetime.fromtimestamp(now if now is not None else time.time())
+    candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= current:
+        candidate += dt.timedelta(days=1)
+    return candidate.timestamp()
+
 
 class AgentError(Exception):
     def __init__(self, message: str, retryable: bool = False):
@@ -206,6 +250,8 @@ class AgentContext:
     effort: str | None
     timeout_seconds: int
     emit: Callable[[str, str, dict[str, Any]], None]
+    # Rate-limit signals seen during the current call; kept on the context so they survive a CLI crash.
+    limit_state: dict[str, Any] = field(default_factory=dict)
 
 
 def _tool_target(name: str, tool_input: dict[str, Any], workspace: Path) -> str:
@@ -333,6 +379,9 @@ class ClaudeAgentBackend:
                     if info.status == "rejected":
                         result.rate_limit_rejected = True
                         result.rate_limit_resets_at = float(info.resets_at) if info.resets_at else None
+                        ctx.limit_state["rejected"] = True
+                        if info.resets_at:
+                            ctx.limit_state["resets_at"] = float(info.resets_at)
                     if info.status != "allowed":
                         ctx.emit(
                             "AGENT_RATE_LIMITED",
@@ -585,6 +634,7 @@ class AgentRunner:
     async def _invoke(self, ctx: AgentContext, prompt: str, resume: str | None) -> BackendResult:
         from claude_agent_sdk import CLIConnectionError, CLINotFoundError, ClaudeSDKError, ProcessError
 
+        ctx.limit_state.clear()
         try:
             result = await self.backend.run(ctx, prompt, resume)
         except CLINotFoundError as exc:
@@ -592,12 +642,17 @@ class AgentRunner:
         except TimeoutError as exc:
             raise AgentError(f"agent timed out after {ctx.timeout_seconds}s", retryable=False) from exc
         except (CLIConnectionError, ProcessError) as exc:
+            detail = f"{exc} {getattr(exc, 'stderr', '') or ''}"
+            self._raise_if_usage_limit(ctx, detail, exc)
             text = str(exc).lower()
             if "auth" in text or "login" in text or "api key" in text:
                 raise FatalAgentError(f"Claude authentication problem: {exc}") from exc
             raise AgentError(f"SDK process error: {exc}", retryable=True) from exc
         except ClaudeSDKError as exc:
+            self._raise_if_usage_limit(ctx, str(exc), exc)
             raise AgentError(f"SDK error: {exc}", retryable=True) from exc
+        if result.is_error:
+            self._raise_if_usage_limit(ctx, f"{result.error_message or ''} {result.result_text or ''}", None)
         if result.assistant_error in {"authentication_failed", "billing_error"}:
             raise FatalAgentError(f"Claude API {result.assistant_error}: check authentication and billing")
         if result.error_subtype == "error_max_budget_usd":
@@ -610,6 +665,20 @@ class AgentRunner:
             error.rate_limited = result.api_error_status == 429 or result.assistant_error == "rate_limit"  # type: ignore[attr-defined]
             raise error
         return result
+
+    @staticmethod
+    def _raise_if_usage_limit(ctx: AgentContext, text: str, cause: BaseException | None) -> None:
+        """Turn a failed call into UsageLimitReached when the plan limit caused it."""
+        if not (ctx.limit_state.get("rejected") or is_usage_limit_text(text)):
+            return
+        resets_at = ctx.limit_state.get("resets_at") or parse_reset_time(text)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(resets_at)) if resets_at else "unknown"
+        match = USAGE_LIMIT_RE.search(text or "")
+        what = match.group(0) if match else "usage limit"
+        error = UsageLimitReached(f"Claude usage limit reached ({what}; resets at {when})", resets_at)
+        if cause is not None:
+            raise error from cause
+        raise error
 
     def _validate(self, ctx: AgentContext, result: BackendResult) -> tuple[AgentOutputBase | None, str]:
         data = result.structured_output

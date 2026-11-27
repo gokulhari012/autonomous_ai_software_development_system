@@ -48,6 +48,7 @@ from agent_runner import (
     ScriptedBackend,
     TurnLimitExceeded,
     UsageLimitReached,
+    is_usage_limit_text,
 )
 from config import BACKUPS_DIR, REPORTS_DIR, WORKSPACES_DIR, AppConfig, ensure_runtime_dirs, severity_rank
 from deployment_manager import DeploymentManager, DeploymentResult
@@ -324,9 +325,38 @@ class Orchestrator:
                 kill_process_tree(pid)
                 notes.append(f"stopped stale staging process pid {pid} (deployment #{row['id']})")
             self.state.update_deployment(row["id"], status="STOPPED", health_status="stopped during recovery")
+        requeued = self._requeue_limit_blocked_tasks()
+        if requeued:
+            notes.append(f"re-queued task(s) {', '.join('#' + str(t) for t in requeued)} that were blocked only by the Claude usage limit")
         if notes:
             self.events.publish("SYSTEM_RECOVERY", "; ".join(notes)[:1500], status="RECOVERED", metadata={"notes": notes})
             self.notifier.notify("SYSTEM_ERROR", "Recovered after interruption", {"Status": "RESUMING"}, notes)
+
+    def _requeue_limit_blocked_tasks(self) -> list[int]:
+        """Tasks blocked because the plan limit made their agents fail are not broken: queue them again.
+
+        Older controller versions did not recognise the CLI's "You've hit your 5-hour limit" error and blocked
+        the task after the stage-error limit; the code and the task itself were fine."""
+        requeued = []
+        for task in self.state.list_tasks(self.pid):
+            if task["status"] == "BLOCKED" and is_usage_limit_text(task.get("blocked_reason")):
+                self.state.transition_task(task["id"], to_status="PENDING", reason="blocked only by the Claude usage limit; re-queued at controller start",
+                                           actor="orchestrator", stage_error_count=0, blocked_reason=None)
+                self.state.audit("orchestrator", "requeue_limit_blocked_task", str(task["id"]))
+                requeued.append(task["id"])
+        return requeued
+
+    def _no_work_reason(self) -> str:
+        blocked = [t for t in self.state.list_tasks(self.pid) if t["status"] == "BLOCKED"]
+        on_hold = [t for t in self.state.list_tasks(self.pid) if t["status"] == "ON_HOLD"]
+        if not blocked and not on_hold:
+            return "no more runnable tasks"
+        parts = []
+        if blocked:
+            parts.append(f"{len(blocked)} blocked task(s) ({', '.join('#' + str(t['id']) for t in blocked[:10])}) need Retry in the Task Manager")
+        if on_hold:
+            parts.append(f"{len(on_hold)} task(s) wait for requirement approval")
+        return "no runnable tasks: " + "; ".join(parts)
 
     # ======================================================= workspace/profile
     def _prepare_workspace(self) -> None:
@@ -792,7 +822,7 @@ class Orchestrator:
                 break
         if running:
             await asyncio.gather(*running.values(), return_exceptions=True)
-        return self.stop_reason or "no more runnable tasks"
+        return self.stop_reason or self._no_work_reason()
 
     async def _idle_until_work_or_stop(self, poll_seconds: float = 5.0) -> None:
         """stop_after=manual: keep the controller alive, waiting for approvals, retries or new work."""

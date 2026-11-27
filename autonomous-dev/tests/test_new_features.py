@@ -110,12 +110,22 @@ def test_push_enabled_without_remote_disables_push_with_notice(tmp_path):
 
 
 # ----------------------------------------------------------- usage limits
-def _limit_handlers(ref: dict, limit_once: bool = True):
+CLI_LIMIT_MESSAGE = "Claude Code returned an error result: You've hit your 5-hour limit · resets 1:50am (Asia/Kolkata)"
+
+
+def _limit_handlers(ref: dict, limit_once: bool = True, real_cli_error: bool = False):
     calls = {"developer": 0}
 
     def developer(call):
         calls["developer"] += 1
         if calls["developer"] == 1 and limit_once:
+            if real_cli_error:
+                from claude_agent_sdk import ProcessError
+
+                # What the SDK really raises: the CLI prints the limit message and exits with code 1.
+                # Press "Resume now" so the test does not wait until 1:50am.
+                ref["state"].kv_set(f"limit_resume_now:{ref['pid']}", "1")
+                raise ProcessError(CLI_LIMIT_MESSAGE, exit_code=1)
             raise UsageLimitReached("Claude usage limit reached (test)", time.time() + 1)
         call.write_file("inventory/stats.py", "VALUE = 1\n")
         ref["state"].set_flag(f"stop:{ref['pid']}", "1", "test")
@@ -138,6 +148,73 @@ def test_usage_limit_auto_resume_waits_and_reruns_stage(tmp_path):
     statuses = [(e["event_type"], e["status"]) for e in orch.state.events_after(0, 3000, orch.pid)]
     assert ("SYSTEM_PAUSED", "WAITING_FOR_LIMIT") in statuses and ("SYSTEM_RESUMED", "RUNNING") in statuses
     assert any("will resume automatically" in m["text"] for m in fake.messages)
+
+
+def test_real_cli_limit_error_waits_instead_of_blocking(tmp_path):
+    """Regression (cal-app3): the CLI's exit-code-1 limit error used to count as a stage error and BLOCK the task."""
+    project = copy_sample("flask-inventory", tmp_path)
+    ref: dict = {}
+    handlers, calls = _limit_handlers(ref, real_cli_error=True)
+    orch, _, _ = _orchestrator(tmp_path, project, handlers, auto_resume_on_limit=True)
+    ref.update(state=orch.state, pid=orch.pid)
+    summary = asyncio.run(orch.run())
+    task = orch.state.list_tasks(orch.pid)[0]
+    assert summary["status"] == "STOPPED" and calls["developer"] == 2  # no transient retries of a limit error
+    assert task["status"] == "IN_PROGRESS" and task["stage"] == "CODE_REVIEW" and task["stage_error_count"] == 0
+    paused = [e for e in orch.state.events_after(0, 3000, orch.pid) if e["event_type"] == "SYSTEM_PAUSED"]
+    assert paused and "5-hour limit" in paused[0]["summary"]
+    until = paused[0]["metadata"]["until"]
+    assert 0 < until - time.time() <= 24 * 3600 + 120  # the parsed "resets 1:50am", not the 15-minute probe
+
+
+def test_real_cli_limit_error_without_auto_resume_stops_not_blocks(tmp_path):
+    project = copy_sample("flask-inventory", tmp_path)
+    ref: dict = {}
+    handlers, calls = _limit_handlers(ref, real_cli_error=True)
+    orch, _, _ = _orchestrator(tmp_path, project, handlers, auto_resume_on_limit=False)
+    ref.update(state=orch.state, pid=orch.pid)
+    summary = asyncio.run(orch.run())
+    task = orch.state.list_tasks(orch.pid)[0]
+    assert summary["status"] == "LIMIT_REACHED" and calls["developer"] == 1
+    assert task["status"] == "IN_PROGRESS" and task["stage"] == "DEVELOPMENT"
+
+
+def test_limit_text_detection_and_reset_parsing():
+    from agent_runner import is_usage_limit_text, parse_reset_time
+
+    assert is_usage_limit_text(CLI_LIMIT_MESSAGE)
+    assert is_usage_limit_text("Claude usage limit reached (resets at unknown)")
+    assert is_usage_limit_text("You've reached your weekly limit")
+    assert not is_usage_limit_text("SDK process error: connection reset by peer")
+    assert not is_usage_limit_text("tests failed: limit parameter must be positive")
+    import datetime as dt
+
+    base = dt.datetime(2026, 11, 26, 21, 40).timestamp()  # local time
+    reset = dt.datetime.fromtimestamp(parse_reset_time("resets 1:50am", base))
+    assert (reset.day, reset.hour, reset.minute) == (27, 1, 50)
+    reset = dt.datetime.fromtimestamp(parse_reset_time("resets 11pm", base))
+    assert (reset.day, reset.hour) == (26, 23)
+    assert parse_reset_time("no time here") is None
+    assert parse_reset_time(CLI_LIMIT_MESSAGE) is not None  # unknown zone without tzdata falls back to local time
+
+
+def test_tasks_blocked_by_the_limit_are_requeued_on_start(tmp_path):
+    project = copy_sample("flask-inventory", tmp_path)
+    ref: dict = {}
+    handlers, _ = _limit_handlers(ref, limit_once=False)
+    orch, _, _ = _orchestrator(tmp_path, project, handlers)
+    ref.update(state=orch.state, pid=orch.pid)
+    state, pid = orch.state, orch.pid
+    state.upsert_project(pid, name="x", path=str(project), mode="existing", status="ACTIVE")
+    limit_task, _ = state.create_task(pid, "limit task", "d")
+    other_task, _ = state.create_task(pid, "broken task", "d")
+    for task_id, reason in ((limit_task, "PRODUCT_VALIDATION failed 2 times: validator error: AgentError: SDK process error: " + CLI_LIMIT_MESSAGE),
+                            (other_task, "tests keep failing after 3 repair attempts")):
+        state.transition_task(task_id, to_status="BLOCKED", reason=reason, blocked_reason=reason)
+    orch._recover()
+    assert state.get_task(limit_task)["status"] == "PENDING" and state.get_task(limit_task)["blocked_reason"] is None
+    assert state.get_task(other_task)["status"] == "BLOCKED"
+    assert "#" + str(other_task) in orch._no_work_reason()
 
 
 def test_usage_limit_without_auto_resume_stops_cleanly(tmp_path):
