@@ -62,5 +62,6 @@
       "model": "claude-sonnet-5-5"
     }
   },
-  "rtk_enabled": true
+  "rtk_enabled": true,
+  "rtk_path": "C:\\Users\\gokul\\AppData\\Local\\Microsoft\\WinGet\\Packages\\rtk-ai.rtk_Microsoft.Winget.Source_8wekyb3d8bbwe\\rtk.exe"
 }
