@@ -222,7 +222,21 @@ class WorkflowConfig(BaseModel):
     # one step stronger: higher effort first, then a stronger model, never above escalation_max_model.
     auto_escalation: bool = False
     escalation_max_model: Literal["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"] = "claude-opus-5-5"
+    # RTK (Rust Token Killer): agents' allowed test commands run through "rtk" for compact output.
+    # Needs rtk installed; if it is missing, agents run the normal commands (see rtk_support.py).
+    rtk_enabled: bool = False
+    rtk_path: str | None = None  # full path to rtk / rtk.exe; empty = find "rtk" on PATH
     agents: dict[str, AgentSettings] = Field(default_factory=dict)
+
+    @field_validator("rtk_path")
+    @classmethod
+    def _rtk_path(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+        if not Path(value).is_absolute() or Path(value).name.lower() not in {"rtk", "rtk.exe"}:
+            raise ValueError("rtk_path must be a full path ending in rtk or rtk.exe")
+        return value
 
     def agent(self, name: str) -> AgentSettings:
         return self.agents.get(name, AgentSettings())

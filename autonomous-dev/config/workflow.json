@@ -61,5 +61,6 @@
       "max_turns": 50,
       "model": "claude-sonnet-5-5"
     }
-  }
+  },
+  "rtk_enabled": true
 }

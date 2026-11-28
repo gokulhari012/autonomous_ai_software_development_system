@@ -133,6 +133,26 @@ def test_agent_team_and_automatic_model_settings(env):
         workflow_file.write_text(original, encoding="utf-8")
 
 
+def test_rtk_setting_and_check(env):
+    client, headers, tmp_path, db_path, name, slug = env
+    client.post("/api/control/create_project", headers=headers, json={"name": name, "path": str(tmp_path / "rtk"), "mode": "new"})
+    url = f"/api/projects/{slug}/settings"
+    workflow_file = CONTROLLER / "config" / "workflow.json"
+    original = workflow_file.read_text(encoding="utf-8")
+    try:
+        data = client.get(url).json()["workflow"]
+        assert data["rtk_enabled"] is False and data["rtk_path"] == ""
+        missing = str(tmp_path / "tools" / "rtk.exe")
+        r = client.put(url, headers=headers, json={"workflow": {"rtk_enabled": True, "rtk_path": missing}})
+        assert r.status_code == 200 and r.json()["workflow"]["rtk_enabled"] is True, r.text
+        check = client.post("/api/control/rtk_check", headers=headers, json={"project": slug}).json()
+        assert check["ok"] is False and "not found" in check["output"]  # clear message, agents fall back to normal commands
+        for bad in ({"rtk_path": "rtk.exe"}, {"rtk_path": "C:\\Tools\\evil.exe"}, {"rtk_enabled": "on"}):
+            assert client.put(url, headers=headers, json={"workflow": bad}).status_code == 400, bad
+    finally:
+        workflow_file.write_text(original, encoding="utf-8")
+
+
 def test_existing_project_description_becomes_notes(env):
     client, headers, tmp_path, db_path, name, slug = env
     existing = tmp_path / "existing"

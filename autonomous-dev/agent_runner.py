@@ -38,10 +38,11 @@ import yaml
 from pydantic import ValidationError
 
 from agent_models import OUTPUT_MODELS, AgentOutputBase, Status, inline_schema
-from config import AGENTS_DIR, AppConfig
+from config import AGENTS_DIR, DATABASE_DIR, AppConfig
 from events import EventBus
 from logging_setup import redact
 from permissions import NEVER_ALLOWED, AgentPolicy, ToolGuard, expand_write_scope
+from rtk_support import RtkRewriter, check_rtk, rtk_env
 from state_manager import StateManager
 
 log = logging.getLogger("agent_runner")
@@ -304,6 +305,11 @@ class ClaudeAgentBackend:
                 env[key] = ""  # blank out inherited secrets for the CLI and its Bash tool
         if self.config.secrets.anthropic_api_key:
             env["ANTHROPIC_API_KEY"] = self.config.secrets.anthropic_api_key
+        wf = self.config.workflow
+        if wf.rtk_enabled:  # the rewritten "rtk pytest" runs in the CLI's Bash tool with this environment
+            env.update(rtk_env(DATABASE_DIR / f"rtk-recall-{self.config.project_id}.db"))
+            if wf.rtk_path:
+                env["PATH"] = str(Path(wf.rtk_path).parent) + os.pathsep + os.environ.get("PATH", "")
         return env
 
     def _sandbox(self) -> dict[str, Any] | None:
@@ -509,9 +515,29 @@ class AgentRunner:
         self.semaphore = asyncio.Semaphore(config.project.max_parallel_agents)
         self.run_id: int | None = None
         self.project_context = ""
+        self._rtk: RtkRewriter | None = None
+        self._rtk_checked = False
 
-    def _system_prompt(self, definition: AgentDefinition, write_scope: list[str], bash: list[list[str]]) -> str:
+    async def _rtk_rewriter(self) -> RtkRewriter | None:
+        """RTK rewriter when enabled and usable; checked once, the result is published as an event."""
+        wf = self.config.workflow
+        if not wf.rtk_enabled or self.backend.name != "claude":
+            return None
+        if not self._rtk_checked:
+            self._rtk_checked = True
+            status = await asyncio.to_thread(check_rtk, wf.rtk_path)
+            if status.usable and status.path:
+                self._rtk = RtkRewriter(status.path)
+                self.events.publish("RTK_STATUS", f"RTK on: agents' test commands use compact output ({status.detail})", metadata={"path": status.path, "version": status.version})
+            else:
+                self.events.publish("RTK_STATUS", f"RTK is enabled but not usable, so agents run normal commands: {status.detail}", status="WARNING", metadata={"path": status.path})
+        return self._rtk
+
+    def _system_prompt(self, definition: AgentDefinition, write_scope: list[str], bash: list[list[str]], rtk: bool = False) -> str:
         bash_text = ", ".join(" ".join(p) for p in bash) or "none (Bash is not available to you)"
+        if rtk:
+            bash_text += (". Test output is shortened by RTK (failures only); if it ends with a hint such as"
+                          " '[full output: rtk recall <id>]', run exactly 'rtk recall <id>' to see all of it")
         scope_text = ", ".join(write_scope) or "none - you have read-only access"
         context = f"\n\n## Project conventions (from CLAUDE.md / project docs)\n{self.project_context[:12000]}" if self.project_context else ""
         return (
@@ -571,13 +597,14 @@ class AgentRunner:
                 emit("AGENT_TOOL_DENIED", f"{tool} {target}: {reason}", {"tool": tool})
                 self.state.audit(f"agent:{definition.name}", "tool_denied", f"{tool} {target}", {"reason": reason, "task_id": request.task_id}, allowed=False)
 
-        guard = ToolGuard(policy, workspace, write_scope, request.extra_read_dirs, on_decision)
+        rtk = await self._rtk_rewriter() if "Bash" in definition.tools and policy.bash_prefixes() else None
+        guard = ToolGuard(policy, workspace, write_scope, request.extra_read_dirs, on_decision, bash_rewriter=rtk)
         ctx = AgentContext(
             definition=definition,
             request=request,
             workspace=workspace,
             guard=guard,
-            system_prompt=self._system_prompt(definition, write_scope, policy.bash_prefixes()),
+            system_prompt=self._system_prompt(definition, write_scope, policy.bash_prefixes(), rtk is not None),
             schema=inline_schema(definition.output_model),
             max_turns=settings.max_turns or self.config.workflow.default_max_turns,
             budget_usd=self._budget_for_call(),

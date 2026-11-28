@@ -538,6 +538,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result = bridge.run_cli(config_path, ["telegram-test"], timeout=90)
             elif action == "git_check":
                 result = bridge.run_cli(config_path, ["git-check"], timeout=120)
+            elif action == "rtk_check":
+                result = bridge.run_cli(config_path, ["rtk-check"], timeout=60)
             elif action == "validate_config":
                 result = bridge.run_cli(config_path, ["validate-config"], timeout=60)
             elif action in ("pause", "resume", "stop"):

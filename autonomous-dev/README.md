@@ -340,6 +340,35 @@ In `workflow.json`:
   or Fable 5.2); the last step is effort `max`. It never downgrades. The chosen model and effort
   appear in each `AGENT_STARTED` event.
 
+### Token saving with RTK (Rust Token Killer)
+
+[RTK](https://github.com/rtk-ai/rtk) is a separate program that shortens command output. For
+example, `rtk pytest` shows only the failing tests. It's off by default. To turn it on:
+
+1. Install it: on Windows, run `winget install rtk-ai.rtk`. Alternatively, download
+   `rtk-x86_64-pc-windows-msvc.zip` from the releases page and put `rtk.exe` on PATH. Don't use
+   `cargo install rtk`, which installs an unrelated "Rust Type Kit".
+2. In the dashboard, open **Settings → Token saving**, tick **Use RTK**, and save. If `rtk` isn't
+   on PATH, also set the full path to `rtk.exe`. In `workflow.json`, the keys are
+   `rtk_enabled` and `rtk_path`.
+3. Press **Check RTK**, or run `python main.py rtk-check`. Doctor also shows the status.
+
+How it works:
+
+* Agents run with `setting_sources=[]`, so a global `rtk init -g` hook for your own Claude Code
+  sessions doesn't reach them. The controller's `PreToolUse` hook uses RTK instead.
+* The hook first checks the original command against the agent's allowlist, and only then asks
+  `rtk rewrite` for a shorter form.
+* A rewrite is used only when it's `rtk pytest`, with arguments taken from the original command,
+  so RTK can't widen what an agent may run. `python -m compileall` and every other command run
+  unchanged.
+* When RTK cuts output short, agents may run `rtk recall <id>` to see the full output. The full
+  output is kept per project in `database/rtk-recall-<project>.db`. RTK telemetry is disabled
+  for these runs.
+* If RTK is missing, the wrong program, too old (below 0.25), or slow (over 3 s), agents run the
+  normal command. An `RTK_STATUS` event shows which case applies.
+* The controller's own authoritative test runs and reports never use RTK.
+
 ---
 
 ## 4. Running the controller's own tests

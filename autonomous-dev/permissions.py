@@ -23,7 +23,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("permissions")
 
@@ -93,7 +93,10 @@ class ToolGuard:
         write_scope: list[str] | None = None,
         extra_read_dirs: list[Path] | None = None,
         on_decision: Callable[[str, dict[str, Any], bool, str], None] | None = None,
+        bash_rewriter: Callable[[str], Awaitable[str | None]] | None = None,
     ):
+        # bash_rewriter (RTK): called only for Bash commands this guard has already allowed.
+        self.bash_rewriter = bash_rewriter
         self.policy = policy
         self.workspace = workspace.resolve()
         self.write_scope = write_scope if write_scope is not None else list(policy.write_scope)
@@ -192,7 +195,12 @@ class ToolGuard:
             return False, f"unparseable command: {exc}"
         if not tokens:
             return False, "empty command"
-        exe = PurePosixPath(tokens[0].replace("\\", "/")).name.lower().removesuffix(".exe")
+        if self.bash_rewriter is not None and self.policy.bash_prefixes():
+            from rtk_support import RECALL_RE
+
+            if RECALL_RE.match(command):
+                return True, ""  # full output of an earlier command that RTK shortened
+        exe =PurePosixPath(tokens[0].replace("\\", "/")).name.lower().removesuffix(".exe")
         normalized = [exe, *tokens[1:]]
         if not any(normalized[: len(prefix)] == prefix for prefix in self.policy.bash_prefixes()):
             return False, f"command not on {self.policy.name}'s allowlist: {tokens[0]} {' '.join(tokens[1:3])}"
@@ -220,6 +228,22 @@ class ToolGuard:
             except Exception:
                 log.exception("permission decision callback failed")
         if allowed:
+            command = str(tool_input.get("command", ""))
+            if tool_name == "Bash" and self.bash_rewriter is not None and not command.lstrip().startswith("rtk"):
+                try:
+                    rewritten = await self.bash_rewriter(command)
+                except Exception:
+                    log.exception("RTK rewrite failed; running the original command")
+                    rewritten = None
+                if rewritten:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": "allowed by autonomous-dev policy; output compacted by RTK",
+                            "updatedInput": {**tool_input, "command": rewritten},
+                        }
+                    }
             return {}
         self.denials.append({"tool": tool_name, "reason": reason})
         return {

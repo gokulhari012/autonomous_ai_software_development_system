@@ -113,6 +113,11 @@ def cmd_doctor(args) -> int:
     checks.append(("GUI session (optional)", True, gui_reason + ("" if cfg.testing.pyside.allow_real_input_automation else "; real input automation disabled by config")))
     tg = cfg.secrets
     checks.append(("Telegram (optional)", True, ("configured" if tg.telegram_enabled and tg.telegram_chat_id else "not configured - notifications are recorded only") + (f", {len(tg.telegram_authorized_user_ids)} authorised user(s)" if tg.telegram_authorized_user_ids else "")))
+    from rtk_support import check_rtk
+
+    rtk = check_rtk(cfg.workflow.rtk_path)
+    rtk_state = "enabled" if cfg.workflow.rtk_enabled else "disabled in settings"
+    checks.append(("RTK token saving (optional)", True, f"{rtk_state}; {rtk.detail}" + ("" if rtk.usable or not cfg.workflow.rtk_enabled else " - agents run normal commands")))
     checks.append(("Project path", cfg.project_dir.exists() or cfg.project.project_mode == "new", str(cfg.project_dir)))
     width = max(len(c[0]) for c in checks)
     failed = 0
@@ -121,6 +126,21 @@ def cmd_doctor(args) -> int:
         print(f"{'OK  ' if ok else 'FAIL'}  {name.ljust(width)}  {detail}")
     print("\nAll required checks passed." if not failed else f"\n{failed} required check(s) failed.")
     return 1 if failed else 0
+
+
+def cmd_rtk_check(args) -> int:
+    cfg = _load(args)
+    from rtk_support import accept_rewrite, check_rtk, run_rtk
+
+    status = check_rtk(cfg.workflow.rtk_path)
+    print(f"RTK setting: {'enabled' if cfg.workflow.rtk_enabled else 'disabled'}")
+    print(("OK    " if status.usable else "FAIL  ") + status.detail)
+    if status.usable and status.path:
+        for command in ("python -m pytest -q", "python -m compileall -q ."):
+            out = run_rtk([status.path, "rewrite", "--", command], 10)
+            used = accept_rewrite(command, out.stdout) if out.returncode in (0, 3) else None
+            print(f"  {command}  ->  {used or 'unchanged (runs normally)'}")
+    return 0 if status.usable else 1
 
 
 # ------------------------------------------------------------------- scan
@@ -446,6 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("--text-stdin", action="store_true")
     answer.set_defaults(func=cmd_answer)
     sub.add_parser("validate-config").set_defaults(func=cmd_validate_config)
+    sub.add_parser("rtk-check", help="check that RTK (Rust Token Killer) is installed and usable").set_defaults(func=cmd_rtk_check)
     sub.add_parser("resume-now", help="stop waiting for a usage-limit reset").set_defaults(func=cmd_resume_now)
     sub.add_parser("git-check", help="check the remote and git credentials (read-only)").set_defaults(func=cmd_git_check)
     project = sub.add_parser("project")

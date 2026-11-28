@@ -140,8 +140,11 @@ WORKFLOW_FIELDS: dict[str, Callable[[Any], Any]] = {
     "auto_model_selection": _bool,
     "auto_escalation": _bool,
     "escalation_max_model": _choice(*UPGRADE_LIMITS),
+    "rtk_enabled": _bool,
+    "rtk_path": _text(400, re.compile(r"^(?:[A-Za-z]:[\\/]|/).*rtk(?:\.exe)?$", re.I)),  # the controller checks it again
 }
-WORKFLOW_DEFAULTS: dict[str, Any] = {"auto_model_selection": False, "auto_escalation": False, "escalation_max_model": "claude-opus-5-5"}
+WORKFLOW_DEFAULTS: dict[str, Any] = {"auto_model_selection": False, "auto_escalation": False, "escalation_max_model": "claude-opus-5-5",
+                                     "rtk_enabled": False, "rtk_path": ""}
 
 # Per-agent overrides. An empty value removes the override, so the agent uses the global default.
 AGENT_FIELDS: dict[str, Callable[[Any], Any]] = {

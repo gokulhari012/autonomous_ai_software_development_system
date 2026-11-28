@@ -139,6 +139,38 @@ function AutomaticModels({ options, values, onChange }) {
   );
 }
 
+function TokenSaving({ project, values, saved, onChange }) {
+  const [check, setCheck] = useState(null);
+  const [busy, setBusy] = useState(false);
+  async function runCheck() {
+    setBusy(true); setCheck(null);
+    try {
+      const r = await api("/api/control/rtk_check", { method: "POST", body: { project } });
+      setCheck({ ok: r.ok, output: r.output || JSON.stringify(r, null, 2) });
+    } catch (err) { setCheck({ ok: false, output: err.message }); }
+    finally { setBusy(false); }
+  }
+  const unsaved = values.rtk_path !== saved.rtk_path;
+  return (
+    <>
+      <div className="form-grid">
+        <Field spec={["rtk_enabled", "Use RTK (Rust Token Killer) to shorten agents' test output", "bool"]} value={values.rtk_enabled} onChange={onChange} />
+        <label>RTK program path (optional)
+          <input value={values.rtk_path ?? ""} placeholder="Empty = find rtk on PATH, e.g. C:\Tools\rtk\rtk.exe" onChange={(e) => onChange("rtk_path", e.target.value)} />
+        </label>
+      </div>
+      <p className="hint">When on, the pytest commands agents run go through <code>rtk pytest</code>, which returns only the failures, so agents read fewer tokens.
+        The permission rules still check the original command, and RTK can't add new commands. If RTK isn't installed or doesn't work, agents run the normal commands.
+        Install on Windows: <code>winget install rtk-ai.rtk</code>. The controller's own test runs and reports are never shortened.</p>
+      <div className="buttons">
+        <button disabled={busy} onClick={runCheck}>{busy ? "Checking..." : "Check RTK"}</button>
+        {unsaved && <span className="hint">Save first to check the new path.</span>}
+      </div>
+      {check && <div><h3>RTK: <span className={`badge ${check.ok ? "ok" : "bad"}`}>{check.ok ? "READY" : "NOT USABLE"}</span></h3><pre className="json">{check.output}</pre></div>}
+    </>
+  );
+}
+
 function Field({ spec, value, onChange }) {
   const [key, label, type, options] = spec;
   if (type === "bool") return <label className="check"><input type="checkbox" checked={!!value} onChange={(e) => onChange(key, e.target.checked)} /> {label}</label>;
@@ -214,6 +246,9 @@ export default function Settings({ project, projects }) {
         <AutomaticModels options={data.options} values={draft.workflow} onChange={setWorkflow} />
         {!draft.workflow.auto_model_selection && <p className="hint">Choose a model and effort level for each agent. "Default" follows the default model and default effort in Global settings.</p>}
         <AgentModels options={data.options} values={draft.workflow} onChange={setWorkflow} disabled={!!draft.workflow.auto_model_selection} />
+      </Section>
+      <Section title="Token saving (all projects)" actions={saveButton}>
+        <TokenSaving project={project} values={draft.workflow} saved={data.workflow} onChange={setWorkflow} />
       </Section>
       <Section title="Fixed safety settings (not editable here)">
         <table><tbody>{Object.entries(data.read_only).map(([k, v]) => <tr key={k}><th>{k}</th><td>{String(v)}</td></tr>)}</tbody></table>
