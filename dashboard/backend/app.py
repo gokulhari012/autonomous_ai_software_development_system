@@ -26,10 +26,9 @@ from .auth import CSRF_COOKIE, SESSION_COOKIE, AuthManager
 from .controller import ControlError, ControllerBridge
 from .db import Database
 from .git_info import git_summary
-from .project_admin import ProjectAdmin, SettingsError
+from .project_admin import AGENTS, ProjectAdmin, SettingsError
 from .settings import DASHBOARD_DIR, Settings, load_settings
 
-AGENTS = ["product_manager", "architect", "developer", "code_reviewer", "qa_engineer", "security_auditor", "bug_fixer", "devops_engineer", "product_validator"]
 ARTIFACT_SUFFIXES = {".png", ".jpg", ".zip", ".json", ".xml", ".log", ".md", ".txt", ".html", ".webm"}
 SENSITIVE_NAMES = {".env", "credentials.json"}
 

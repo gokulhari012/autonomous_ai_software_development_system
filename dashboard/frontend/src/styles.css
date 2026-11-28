@@ -77,5 +77,10 @@ label.block { margin-bottom: 12px; }
 .attention.warn { border-color: var(--warn); }
 .attention.info { border-color: var(--info); }
 .question-set { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+.agent-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px 20px; margin-bottom: 12px; }
+.agent-choice { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; }
+.agent-choice input { margin-top: 3px; }
+.agent-choice input:disabled + span { opacity: .75; }
+select:disabled { background: #f0f2f5; color: var(--muted); }
 .artifacts { display: flex; flex-wrap: wrap; gap: 10px; }
 .artifacts img { max-width: 320px; border: 1px solid var(--border); border-radius: 4px; }

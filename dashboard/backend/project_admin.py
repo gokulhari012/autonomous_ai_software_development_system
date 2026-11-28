@@ -17,6 +17,35 @@ from typing import Any, Callable
 from .settings import Settings
 
 MODEL_RE = re.compile(r"^claude-[a-z0-9.\-]{1,60}$")
+
+# Choices offered in the Settings drop-downs. Every model listed accepts every effort level.
+# A different claude-* ID set by hand in workflow.json is still shown and kept.
+MODELS: list[tuple[str, str]] = [
+    ("claude-fable-5-2", "Claude Fable 5.2"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("claude-opus-5", "Claude Opus 5"),
+    ("claude-opus-4-8", "Claude Opus 4.8"),
+    ("claude-sonnet-5", "Claude Sonnet 5"),
+]
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+AGENTS = ["product_manager", "architect", "developer", "code_reviewer", "qa_engineer", "security_auditor", "bug_fixer", "devops_engineer", "product_validator"]
+# Must match CORE_AGENTS / OPTIONAL_AGENTS in autonomous-dev/config.py.
+CORE_AGENTS = ("product_manager", "developer", "code_reviewer", "product_validator")
+OPTIONAL_AGENTS = ("architect", "qa_engineer", "security_auditor", "bug_fixer", "devops_engineer")
+AGENT_ROLES: dict[str, str] = {
+    "product_manager": "Always runs: turns the brief into requirements and tasks.",
+    "architect": "Designs each task before coding. Without it, the Developer works from the task description.",
+    "developer": "Always runs: writes the code and unit tests.",
+    "code_reviewer": "Always runs: independent code review is a fixed safety setting.",
+    "qa_engineer": "Writes tests for every acceptance criterion and analyses failures. Without it, the full test suite still runs.",
+    "security_auditor": "Reviews scanner findings and checks the change by hand. Without it, Bandit, Semgrep and pip-audit still run and block.",
+    "bug_fixer": "Fixes problems found by review, tests and scans (runs only when something fails). Without it, the Developer fixes them.",
+    "devops_engineer": "Diagnoses a staging app that will not start (runs only then). Without it, the failure goes straight to repair.",
+    "product_validator": "Always runs: independent acceptance validation is a fixed safety setting.",
+}
+UPGRADE_LIMITS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9._-]{1,50}$")
 
 
@@ -63,6 +92,12 @@ def _text(max_len: int, pattern: re.Pattern | None = None, allow_empty: bool = T
     return check
 
 
+def _team_agents(value: Any) -> list[str]:
+    if not isinstance(value, list) or any(v not in OPTIONAL_AGENTS for v in value):
+        raise ValueError(f"must be a list of optional agents ({', '.join(OPTIONAL_AGENTS)})")
+    return [a for a in OPTIONAL_AGENTS if a in value]
+
+
 def _app_types(value: Any) -> list[str]:
     if not isinstance(value, list) or not value or any(v not in {"flask", "pyside", "python"} for v in value):
         raise ValueError("must be a non-empty list of flask / pyside / python")
@@ -76,6 +111,8 @@ PROJECT_FIELDS: dict[str, Callable[[Any], Any]] = {
     "git_remote_url": _text(300),
     "stop_after": _choice("task", "requirements", "manual"),
     "auto_resume_on_limit": _bool,
+    "agent_team.mode": _choice("full", "custom", "auto"),
+    "agent_team.agents": _team_agents,
     "max_retries_per_task": _int(0, 10),
     "max_tasks_per_run": _int(1, 10000),
     "max_parallel_tasks": _int(1, 4),
@@ -91,7 +128,7 @@ PROJECT_FIELDS: dict[str, Callable[[Any], Any]] = {
 WORKFLOW_FIELDS: dict[str, Callable[[Any], Any]] = {
     "model": _text(64, MODEL_RE, allow_empty=False),
     "fallback_model": _text(64, MODEL_RE),
-    "default_effort": _choice("low", "medium", "high", "xhigh", "max"),
+    "default_effort": _choice(*EFFORTS),
     "max_budget_usd": _float(0.1, 100000),
     "max_budget_usd_per_agent_call": _float(0.05, 10000),
     "max_execution_minutes": _int(5, 100000),
@@ -100,7 +137,19 @@ WORKFLOW_FIELDS: dict[str, Callable[[Any], Any]] = {
     "max_agent_turns_per_task": _int(10, 10000),
     "transient_retry_attempts": _int(0, 6),
     "max_stage_errors": _int(1, 5),
+    "auto_model_selection": _bool,
+    "auto_escalation": _bool,
+    "escalation_max_model": _choice(*UPGRADE_LIMITS),
 }
+WORKFLOW_DEFAULTS: dict[str, Any] = {"auto_model_selection": False, "auto_escalation": False, "escalation_max_model": "claude-opus-5-5"}
+
+# Per-agent overrides. An empty value removes the override, so the agent uses the global default.
+AGENT_FIELDS: dict[str, Callable[[Any], Any]] = {
+    f"agents.{name}.{key}": check
+    for name in AGENTS
+    for key, check in (("model", _text(64, MODEL_RE)), ("effort", _choice("", *EFFORTS)))
+}
+WORKFLOW_FIELDS.update(AGENT_FIELDS)
 
 
 # The controller's defaults (autonomous-dev/config.py) for keys an older project file may not contain,
@@ -110,6 +159,7 @@ PROJECT_DEFAULTS: dict[str, Any] = {
     "auto_resume_on_limit": False, "max_retries_per_task": 3, "max_tasks_per_run": 100, "max_parallel_tasks": 1,
     "auto_approve_inferred_requirements": False, "application_types": [], "flask.lan_access": False, "flask.staging_port": 5055, "flask.qa_port": 5056,
     "flask.health_path": "/health", "pyside.startup_seconds": 6,
+    "agent_team.mode": "full", "agent_team.agents": list(OPTIONAL_AGENTS),
 }
 
 
@@ -132,6 +182,13 @@ def _set(data: dict[str, Any], dotted: str, value: Any) -> None:
     for part in parts[:-1]:
         node = node.setdefault(part, {})
     node[parts[-1]] = value
+
+
+def _unset(data: dict[str, Any], dotted: str) -> None:
+    parent, _, leaf = dotted.rpartition(".")
+    node = _get(data, parent) if parent else data
+    if isinstance(node, dict):
+        node.pop(leaf, None)
 
 
 class ProjectAdmin:
@@ -166,7 +223,11 @@ class ProjectAdmin:
         workflow = json.loads((self.config_dir / "workflow.json").read_text(encoding="utf-8"))
         return {
             "project": {key: (_get(data, key) if _get(data, key) is not None else PROJECT_DEFAULTS.get(key)) for key in PROJECT_FIELDS},
-            "workflow": {key: _get(workflow, key) for key in WORKFLOW_FIELDS},
+            "workflow": {key: ((_get(workflow, key) or "") if key in AGENT_FIELDS else _get(workflow, key) if _get(workflow, key) is not None else WORKFLOW_DEFAULTS.get(key))
+                         for key in WORKFLOW_FIELDS},
+            "options": {"models": [{"id": i, "label": label} for i, label in MODELS], "efforts": list(EFFORTS), "agents": AGENTS,
+                        "agent_roles": [{"name": a, "required": a in CORE_AGENTS, "role": AGENT_ROLES[a]} for a in AGENTS],
+                        "upgrade_limits": [{"id": i, "label": label} for i, label in MODELS if i in UPGRADE_LIMITS]},
             "read_only": {key: data.get(key) for key in ("project_name", "project_path", "project_mode", "development_branch", "default_branch",
                                                          "git_isolation", "production_deployment", "require_independent_review", "require_acceptance_validation")},
         }
@@ -194,7 +255,10 @@ class ProjectAdmin:
                     continue
                 data = json.loads(originals[path])
                 for key, value in clean.items():
-                    _set(data, key, value)
+                    if key in AGENT_FIELDS and value == "":
+                        _unset(data, key)
+                    else:
+                        _set(data, key, value)
                 path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
             check = self.run_cli(str(config_path), ["validate-config"], timeout=60)
             if not check["ok"]:

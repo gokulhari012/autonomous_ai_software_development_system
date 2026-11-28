@@ -300,6 +300,46 @@ Reports are written under `reports/tests/<project>/task-N/...`: JUnit XML, JSON,
 per-agent `effort` is set in the same file. `max_parallel_tasks` (default 1) runs independent tasks
 concurrently with file reservations. Test runs, scans and commits are serialised.
 
+### Agent team, automatic models and upgrades
+
+`agent_team` in a project file chooses which agents work on its tasks (`agent_selection.py`):
+
+* `"mode": "full"` (default): every agent runs.
+* `"mode": "custom"`: the core agents plus those listed in `"agents"`.
+* `"mode": "auto"`: each task gets the agents it needs, judged from its kind, size and scope.
+  Simple, documentation and test tasks skip the Architect and QA Engineer. They also skip the
+  Security Auditor unless they touch security-sensitive code. The plan is fixed when the task
+  starts and is reported as an `AGENT_TEAM_SELECTED` event.
+
+The Product Manager, Developer, Code Reviewer and Product Validator always run. Here is what
+happens when an optional agent is not on the team:
+
+| Agent | Without it |
+|---|---|
+| Architect | The Developer works from the task description; there is no design step. |
+| QA Engineer | The orchestrator still runs the full test suite, and failures go straight to repair. |
+| Security Auditor | Bandit, Semgrep and pip-audit still run, and the blocking policy still applies. |
+| Bug Fixer | The Developer fixes the open review, test, scan and staging issues. |
+| DevOps Engineer | A staging app that will not start is recorded as an issue and sent for repair. |
+
+In `workflow.json`:
+
+* `auto_model_selection: true` picks the model and effort from the task's complexity, and the
+  per-agent `model`/`effort` settings are then ignored:
+
+  | Task complexity | Model | Effort |
+  |---|---|---|
+  | Simple | Sonnet 5.5 | medium |
+  | Standard | Opus 5.5 | high |
+  | Complex | Opus 5.5 | xhigh |
+
+  The QA Engineer and DevOps Engineer run one effort level lower.
+* `auto_escalation: true` retries an agent one step stronger after each failed attempt. A failed
+  attempt is an error, an invalid output, or, for the Developer and Bug Fixer, work sent back for
+  repair. Effort rises first, then the model, up to `escalation_max_model` (Sonnet 5.5, Opus 5.5
+  or Fable 5.2); the last step is effort `max`. It never downgrades. The chosen model and effort
+  appear in each `AGENT_STARTED` event.
+
 ---
 
 ## 4. Running the controller's own tests

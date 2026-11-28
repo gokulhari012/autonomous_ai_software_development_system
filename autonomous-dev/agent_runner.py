@@ -195,6 +195,10 @@ class AgentRequest:
     replacements: dict[str, list[str]] = field(default_factory=dict)
     extra_read_dirs: list[Path] = field(default_factory=list)
     input_summary: str = ""
+    # Chosen by the orchestrator (automatic selection / upgrade); None = workflow.json settings.
+    model: str | None = None
+    effort: str | None = None
+    selection_note: str = ""
 
 
 @dataclass
@@ -577,13 +581,15 @@ class AgentRunner:
             schema=inline_schema(definition.output_model),
             max_turns=settings.max_turns or self.config.workflow.default_max_turns,
             budget_usd=self._budget_for_call(),
-            model=settings.model or self.config.workflow.model,
+            model=request.model or settings.model or self.config.workflow.model,
             fallback_model=self.config.workflow.fallback_model,
-            effort=settings.effort or self.config.workflow.default_effort,
+            effort=request.effort or settings.effort or self.config.workflow.default_effort,
             timeout_seconds=settings.timeout_seconds or self.config.workflow.agent_timeout_seconds,
             emit=emit,
         )
-        self.events.publish("AGENT_STARTED", f"{definition.name} started ({request.stage})", status="IN_PROGRESS", task_id=request.task_id, agent=definition.name, metadata={"agent_run_id": agent_run_id, "backend": self.backend.name})
+        choice = f"{ctx.model or 'default model'} / {ctx.effort or 'default'} effort" + (f" - {request.selection_note}" if request.selection_note else "")
+        self.events.publish("AGENT_STARTED", f"{definition.name} started ({request.stage}): {choice}", status="IN_PROGRESS", task_id=request.task_id, agent=definition.name,
+                            metadata={"agent_run_id": agent_run_id, "backend": self.backend.name, "model": ctx.model, "effort": ctx.effort, "selection": request.selection_note})
 
         async with self.semaphore:
             try:

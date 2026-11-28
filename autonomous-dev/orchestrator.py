@@ -50,6 +50,7 @@ from agent_runner import (
     UsageLimitReached,
     is_usage_limit_text,
 )
+from agent_selection import TeamPlan, auto_model, escalate, failed_attempts, plan_team, task_complexity
 from config import BACKUPS_DIR, REPORTS_DIR, WORKSPACES_DIR, AppConfig, ensure_runtime_dirs, severity_rank
 from deployment_manager import DeploymentManager, DeploymentResult
 from events import EventBus
@@ -95,7 +96,7 @@ TASK_TRANSITIONS: dict[Stage, set[Stage]] = {
     S.CODE_REVIEW: {S.QA_TESTING, S.BUG_FIXING, S.DEVELOPMENT},
     S.QA_TESTING: {S.SECURITY_TESTING, S.BUG_FIXING},
     S.SECURITY_TESTING: {S.LOCAL_STAGING_DEPLOYMENT, S.BUG_FIXING},
-    S.BUG_FIXING: {S.CODE_REVIEW, S.QA_TESTING},
+    S.BUG_FIXING: {S.CODE_REVIEW, S.QA_TESTING, S.DEVELOPMENT},  # -> DEVELOPMENT when the Bug Fixer is not on the team
     S.LOCAL_STAGING_DEPLOYMENT: {S.PRODUCT_VALIDATION, S.BUG_FIXING, S.LOCAL_STAGING_DEPLOYMENT},
     S.PRODUCT_VALIDATION: {S.GIT_CHECKPOINT, S.BUG_FIXING, S.DEVELOPMENT},
     S.GIT_CHECKPOINT: {S.COMPLETED},
@@ -707,7 +708,8 @@ class Orchestrator:
                 self.state.kv_set(f"spec_output:{self.pid}", result.output.model_dump_json())
             await self._project_stage(Stage.PROJECT_SPECIFICATION, specification)
 
-        if self.config.project.require_architecture_design and not self._stage_done(Stage.PROJECT_ARCHITECTURE):
+        with_architect = self.config.project.require_architecture_design and self._team(None).has("architect")
+        if with_architect and not self._stage_done(Stage.PROJECT_ARCHITECTURE):
             async def architecture():
                 approval = self.state.approval_status(self.pid, "TECH_STACK", "project:architecture")
                 if approval == "PENDING":
@@ -735,7 +737,8 @@ class Orchestrator:
             async def planning():
                 init_id, _ = self.state.create_task(
                     self.pid, "Initialize project structure",
-                    "Create the project skeleton following docs/architecture.md: source package, configuration with an environment "
+                    "Create the project skeleton " + ("following docs/architecture.md" if with_architect else "using the technology named in the brief and docs/PRD.md (a simple, conventional layout)")
+                    + ": source package, configuration with an environment "
                     "variable template (.env.example, no real secrets), database models and initial migration, logging, error handling, "
                     "dependency file, README with run instructions, a health check (web) or main window (desktop), and initial automated tests.",
                     None, 1, "infrastructure",
@@ -1043,10 +1046,53 @@ class Orchestrator:
     # ============================================================ helpers
     async def _agent(self, name: str, prompt: str, task: dict[str, Any] | None, stage: str, replacements: dict[str, list[str]] | None = None, read_dirs: list[Path] | None = None) -> AgentResult:
         assert self.workspace is not None
+        fresh = (self.state.get_task(task["id"]) or task) if task else None
         if task:
             self.state.update_task_fields(task["id"], assigned_agent=name)
-        request = AgentRequest(name, prompt, stage, task["id"] if task else None, replacements or {}, read_dirs or [], input_summary=prompt[:600])
+        model, effort, note = self._model_for(name, fresh)
+        request = AgentRequest(name, prompt, stage, task["id"] if task else None, replacements or {}, read_dirs or [], input_summary=prompt[:600],
+                               model=model, effort=effort, selection_note=note)
         return await self.runner.run(request, self.workspace)
+
+    def _model_for(self, agent: str, task: dict[str, Any] | None) -> tuple[str | None, str | None, str]:
+        """Model and effort for one agent call; (None, None) keeps the workflow.json settings."""
+        wf = self.config.workflow
+        model: str | None = None
+        effort: str | None = None
+        notes: list[str] = []
+        if wf.auto_model_selection:
+            level, why = task_complexity(task, self._design(task) if task else None)
+            model, effort = auto_model(agent, level)
+            notes.append(f"automatic: {level}" + (f" ({', '.join(why[:3])})" if why else ""))
+        steps = failed_attempts(agent, task) if wf.auto_escalation else 0
+        if steps:
+            settings = wf.agent(agent)
+            base_model = model or settings.model or wf.model
+            base_effort = effort or settings.effort or wf.default_effort
+            up_model, up_effort = escalate(base_model, base_effort, steps, wf.escalation_max_model)
+            if (up_model, up_effort) != (base_model, base_effort):
+                model, effort = up_model, up_effort
+                notes.append(f"upgraded from {base_model} / {base_effort} after {steps} failed attempt(s)")
+            else:
+                notes.append(f"{steps} failed attempt(s), already at the upgrade limit ({wf.escalation_max_model})")
+        return model, effort, "; ".join(notes)
+
+    def _team(self, task: dict[str, Any] | None) -> TeamPlan:
+        """The agents that run for this task. An automatic plan is fixed when the task first needs it."""
+        team_cfg = self.config.project.agent_team
+        if task is None:
+            return plan_team(team_cfg, None)
+        fresh = self.state.get_task(task["id"]) or task
+        stored = self._design(fresh).get("agent_team") or {}
+        if team_cfg.mode == "auto" and stored.get("mode") == "auto":
+            return TeamPlan(set(stored.get("agents") or []), "auto", stored.get("reason", ""), stored.get("skipped") or {})
+        plan = plan_team(team_cfg, fresh, task_complexity(fresh, self._design(fresh))[0])
+        if plan.to_dict() != stored:
+            self._save_design(task["id"], agent_team=plan.to_dict())
+            left_out = "; ".join(f"{a.replace('_', ' ')} ({why})" for a, why in plan.skipped.items())
+            self.events.publish("AGENT_TEAM_SELECTED", f"#{task['id']} agent team ({plan.mode}): " + (f"without {left_out}" if left_out else "all agents"),
+                                status="OK", task_id=task["id"], metadata=plan.to_dict())
+        return plan
 
     def _task_context(self, task: dict[str, Any]) -> str:
         req = self.state.get_requirement(task["requirement_id"]) if task.get("requirement_id") else None
@@ -1127,6 +1173,10 @@ class Orchestrator:
         if not self.config.project.require_architecture_design and design.get("approach") is None:
             self._save_design(task["id"], approach="(architecture design disabled by configuration)")
             return StageOutcome(S.DEVELOPMENT, "architecture design not required")
+        team = self._team(task)
+        if not team.has("architect") and design.get("approach") is None:
+            self._save_design(task["id"], approach="(no design step: the Architect is not on the agent team; work from the task description and the existing code)")
+            return StageOutcome(S.DEVELOPMENT, f"Architect not on the agent team ({team.skipped.get('architect', 'not selected')})")
         prompt = (f"{self._task_context(task)}\n\n## Your job\nDesign the implementation of this task for the existing codebase. "
                   f"Inspect the relevant code first. List every file to create or modify (relative paths, including tests under `{self.config.project.test_dir}/`). "
                   "Respect the existing technology stack and conventions; avoid rewriting working code. Flag changes that need human approval.")
@@ -1161,12 +1211,17 @@ class Orchestrator:
             if not ok:
                 return StageOutcome(error=True, reason=f"files reserved by another task: {conflicts}")
         design = self._design(task)
-        previous = self.state.open_issues(task["id"], ["development"])
+        # Without a Bug Fixer on the team, the Developer gets every open issue (review, tests, security, staging).
+        fixes_all = not self._team(task).has("bug_fixer")
+        previous = self.state.open_issues(task["id"], None if fixes_all else ["development"])
         notes = ""
         if interrupted:
             notes += "\n\nNOTE: a previous development attempt was interrupted. Inspect the current state of the files (some changes may already exist) and complete the work.\n"
         if previous:
-            notes += "\n\n## Problems with the previous attempt\n" + "\n".join(f"- {i['title']}: {i['description'][:500]}" for i in previous)
+            notes += "\n\n## Problems with the previous attempt - fix every one\n" + "\n".join(
+                f"- [{i['category']}] {i['title']}" + (f" ({i['file_path']}:{i.get('line_number') or ''})" if i.get("file_path") else "")
+                + f": {i['description'][:500 if not fixes_all else 1200]}" + (f"\n  Recommendation: {i['recommendation'][:400]}" if i.get("recommendation") else "")
+                for i in previous)
         prompt = (f"{self._task_context(task)}\n\n## Design from the Architect\n```json\n{json.dumps({k: design.get(k) for k in ('approach', 'files', 'database_changes', 'api_changes', 'dependencies', 'security', 'test_plan')}, indent=1)[:12000]}\n```\n"
                   f"{notes}\n## Your job\nImplement this task now, including unit tests under `{self.config.project.test_dir}/`. "
                   f"You may check your work with `python -m pytest {self.config.project.test_dir} -q -m \"not e2e and not gui and not acceptance\"`.")
@@ -1246,7 +1301,9 @@ class Orchestrator:
         first_pass = self.state.count_stage_runs(task["id"], S.QA_TESTING.value) <= 1 or interrupted
         layers_preview = self.test_manager.plan_layers(self.workspace, "QA_TESTING", "http://127.0.0.1:<qa-port>")
         layer_text = "\n".join(f"- {l.name} ({l.tool}): marker expression `{l.marker_expr}`" + (f" - BLOCKED here: {l.blocked_reason}" if l.blocked_reason and "URL" not in l.blocked_reason else "") for l in layers_preview)
-        if first_pass:
+        # Without a QA Engineer the orchestrator still runs the whole suite; failures go straight to repair.
+        qa_on = self._team(task).has("qa_engineer")
+        if first_pass and qa_on:
             diff = self.git.diff(self.workspace, task.get("base_commit"), max_chars=60_000)
             prompt = (f"{self._task_context(task)}\n\n## Change under test\n```diff\n{diff}\n```\n\n## Testing layers the orchestrator will run\n{layer_text}\n"
                       "- Browser tests: mark with @pytest.mark.e2e, use the `page` fixture with relative URLs; the orchestrator starts the app and passes --base-url.\n"
@@ -1263,27 +1320,29 @@ class Orchestrator:
         suite = await self._run_tests_with_server(task, "QA_TESTING")
         fix_rounds = 0
         while suite.status in ("FAIL", "ERROR"):
-            artifacts = sorted({a for l in suite.layers for a in l.artifacts})[:40]
-            read_dirs = [Path(l.artifacts_dir) for l in suite.layers if l.artifacts_dir]
-            can_fix = fix_rounds < self.config.workflow.qa_test_fix_attempts
-            prompt = (f"{self._task_context(task)}\n\n## Authoritative test results (executed by the orchestrator)\n{self._suite_text(suite)}\n\n"
-                      "## Evidence artifacts - inspect them before concluding\n" + ("\n".join(f"- {a}" for a in artifacts) or "- (none)") + "\n"
-                      + "".join(f"- pytest log: {Path(l.artifacts_dir) / f'pytest-{l.layer}.log'}\n" for l in suite.layers if l.artifacts_dir) +
-                      "\n## Your job\nClassify every failing test as application_bug, test_defect or environment, with evidence. "
-                      + ("Fix test defects now (only inside the test directory). Never weaken assertions to hide application bugs." if can_fix else "Do not modify tests in this call."))
-            analysis = await self._agent("qa_engineer", prompt, task, S.QA_TESTING.value, read_dirs=read_dirs)
-            if analysis.status == Status.ERROR or not analysis.output:
-                return StageOutcome(error=True, reason=f"QA analysis error: {analysis.error}")
-            classes = [f.classification for f in analysis.output.failure_analysis]
-            app_bugs = [f for f in analysis.output.failure_analysis if f.classification == "application_bug"]
-            env_issues = [f for f in analysis.output.failure_analysis if f.classification == "environment"]
-            if can_fix and "test_defect" in classes and not app_bugs:
-                fix_rounds += 1
-                suite = await self._run_tests_with_server(task, "QA_TESTING")
-                continue
-            if env_issues and not app_bugs:
-                return StageOutcome(block_reason="test environment problem: " + "; ".join(f"{e.test_id}: {e.explanation[:200]}" for e in env_issues[:3]))
-            for bug in app_bugs or []:
+            app_bugs: list[Any] = []
+            if qa_on:
+                artifacts = sorted({a for l in suite.layers for a in l.artifacts})[:40]
+                read_dirs = [Path(l.artifacts_dir) for l in suite.layers if l.artifacts_dir]
+                can_fix = fix_rounds < self.config.workflow.qa_test_fix_attempts
+                prompt = (f"{self._task_context(task)}\n\n## Authoritative test results (executed by the orchestrator)\n{self._suite_text(suite)}\n\n"
+                          "## Evidence artifacts - inspect them before concluding\n" + ("\n".join(f"- {a}" for a in artifacts) or "- (none)") + "\n"
+                          + "".join(f"- pytest log: {Path(l.artifacts_dir) / f'pytest-{l.layer}.log'}\n" for l in suite.layers if l.artifacts_dir) +
+                          "\n## Your job\nClassify every failing test as application_bug, test_defect or environment, with evidence. "
+                          + ("Fix test defects now (only inside the test directory). Never weaken assertions to hide application bugs." if can_fix else "Do not modify tests in this call."))
+                analysis = await self._agent("qa_engineer", prompt, task, S.QA_TESTING.value, read_dirs=read_dirs)
+                if analysis.status == Status.ERROR or not analysis.output:
+                    return StageOutcome(error=True, reason=f"QA analysis error: {analysis.error}")
+                classes = [f.classification for f in analysis.output.failure_analysis]
+                app_bugs = [f for f in analysis.output.failure_analysis if f.classification == "application_bug"]
+                env_issues = [f for f in analysis.output.failure_analysis if f.classification == "environment"]
+                if can_fix and "test_defect" in classes and not app_bugs:
+                    fix_rounds += 1
+                    suite = await self._run_tests_with_server(task, "QA_TESTING")
+                    continue
+                if env_issues and not app_bugs:
+                    return StageOutcome(block_reason="test environment problem: " + "; ".join(f"{e.test_id}: {e.explanation[:200]}" for e in env_issues[:3]))
+            for bug in app_bugs:
                 issue_id, created = self.state.add_issue(self.pid, task["id"], f"Test failure: {bug.test_id}", bug.severity.value, "qa", "qa_engineer",
                                                           bug.explanation + "\nEvidence: " + ", ".join(bug.evidence_artifacts), bug.file_path, bug.line_number)
                 if created:
@@ -1338,17 +1397,20 @@ class Orchestrator:
         read_dirs = sorted({Path(r.report_path).parent for r in results if r.report_path})
         prompt = (f"{self._task_context(task)}\n\n## Scanner runs (executed by the orchestrator)\n{scan_text}\n\n## Open findings\n{finding_text}\n\n"
                   f"## Change under review\n```diff\n{diff}\n```\n\nAssess every finding with evidence and perform the manual security checks on the change.")
-        result = await self._agent("security_auditor", prompt, task, S.SECURITY_TESTING.value, read_dirs=read_dirs)
-        if result.status == Status.ERROR or not result.output:
-            return StageOutcome(error=True, reason=f"security auditor error: {result.error}")
-        out = result.output
+        # Without a Security Auditor the scanner results and the blocking policy decide on their own.
+        out = None
+        if self._team(task).has("security_auditor"):
+            result = await self._agent("security_auditor", prompt, task, S.SECURITY_TESTING.value, read_dirs=read_dirs)
+            if result.status == Status.ERROR or not result.output:
+                return StageOutcome(error=True, reason=f"security auditor error: {result.error}")
+            out = result.output
         valid_ids = {f["id"] for f in open_findings}
-        for assessment in out.assessments:
+        for assessment in (out.assessments if out else []):
             if assessment.finding_id not in valid_ids or not assessment.evidence.strip():
                 continue
             status = {"VERIFIED": "VERIFIED", "LIKELY_FALSE_POSITIVE": "FALSE_POSITIVE_SUSPECTED", "NEEDS_HUMAN_REVIEW": "NEEDS_REVIEW"}[assessment.verdict]
             self.state.update_security_finding(assessment.finding_id, status=status, auditor_assessment=assessment.model_dump())
-        for finding in out.findings:
+        for finding in (out.findings if out else []):
             if not finding.evidence.strip():
                 continue  # the auditor must provide evidence for every finding
             fp = fingerprint("security_auditor", finding.title, finding.file_path or "")
@@ -1360,7 +1422,7 @@ class Orchestrator:
             }, baseline=False)
         decision = self.scanner.evaluate_policy(results, set(self._changed_files(task)))
         report = self._write_report("security", f"task-{task['id']}-security-{self.state.count_stage_runs(task['id'], S.SECURITY_TESTING.value)}.json",
-                                    {"scans": [r.__dict__ for r in results], "auditor": out.model_dump(), "decision": decision.__dict__})
+                                    {"scans": [r.__dict__ for r in results], "auditor": out.model_dump() if out else "not on the agent team", "decision": decision.__dict__})
         for f in decision.blocking[:10]:
             self.events.publish("SECURITY_FINDING", f"[{f['severity']}] {f['tool_name']} {f.get('file_path')}:{f.get('line_number')} {f['description'][:200]}", status="BLOCKING", task_id=task["id"], metadata={"finding_id": f["id"]})
         if decision.status == "PASS":
@@ -1386,6 +1448,8 @@ class Orchestrator:
         issues = self.state.open_issues(task["id"])
         if not issues:
             return StageOutcome(S.CODE_REVIEW if self.config.workflow.review_after_fix else S.QA_TESTING, "no open issues to fix; re-verifying")
+        if not self._team(task).has("bug_fixer"):
+            return StageOutcome(S.DEVELOPMENT, f"Bug Fixer not on the agent team; the Developer fixes the {len(issues)} open issue(s)")
         issue_files = sorted({i["file_path"] for i in issues if i.get("file_path") and i["file_path"] not in ("environment",) and "," not in i["file_path"]})
         latest_failures = [f for r in self.state.list_test_runs(self.pid, task["id"], 10) for f in self.state.test_cases(r["id"]) if f["status"] in ("FAIL", "ERROR")][:10]
         issue_text = "\n".join(f"- [issue_id {i['id']}] ({i['category']}, {i['severity']}, from {i['source_agent']}) {i['title']} | {i.get('file_path') or '-'}:{i.get('line_number') or ''}\n  {i['description'][:1200]}\n  Recommendation: {(i.get('recommendation') or '')[:400]}" for i in issues)
@@ -1453,6 +1517,10 @@ class Orchestrator:
         return StageOutcome(S.PRODUCT_VALIDATION, f"staging healthy ({result.method}{' at ' + result.url if result.url else ''}); staging tests passed")
 
     async def _handle_staging_failure(self, task: dict[str, Any], result: DeploymentResult) -> StageOutcome:
+        if not self._team(task).has("devops_engineer"):
+            detail = f"{result.error}\n\nStartup log (tail):\n{redact((result.detail or {}).get('log_tail', ''))[-4000:]}"
+            self.state.add_issue(self.pid, task["id"], "Application fails to start in staging", "HIGH", "staging", "orchestrator", detail)
+            return self._repair(task, S.BUG_FIXING, f"staging deployment failed (DevOps Engineer not on the agent team): {(result.error or '')[:300]}")
         retry_key = f"devops_retry:{task['id']}:{task['retry_count']}"
         prompt = (f"{self._task_context(task)}\n\n## Failed staging deployment\nMethod: {result.method}\nError: {result.error}\n"
                   f"Command: {(result.detail or {}).get('command', '')}\nEnvironment variable names: {(result.detail or {}).get('env_vars', [])}\n\n"

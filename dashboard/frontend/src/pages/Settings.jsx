@@ -20,9 +20,16 @@ const PROJECT_FIELDS = [
   ["pyside.startup_seconds", "Desktop app startup check (seconds)", "int"],
   ["project_notes", "Extra instructions for the Product Manager", "textarea"],
 ];
+// Model and effort choices come from the backend, so these drop-downs are built from its "options".
+const modelFields = (options) => {
+  const models = options.models.map((m) => [m.id, m.label]);
+  return [
+    ["model", "Default Claude model", "select", models],
+    ["fallback_model", "Fallback model", "select", [["", "No fallback"], ...models]],
+    ["default_effort", "Default effort", "select", options.efforts.map((e) => [e, e])],
+  ];
+};
 const WORKFLOW_FIELDS = [
-  ["model", "Claude model", "text"], ["fallback_model", "Fallback model", "text"],
-  ["default_effort", "Default effort", "select", [["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]]],
   ["max_budget_usd", "Budget per run (USD, SDK-reported)", "float"], ["max_budget_usd_per_agent_call", "Budget per agent call (USD)", "float"],
   ["max_execution_minutes", "Maximum run time (minutes, usage-limit waits excluded)", "int"],
   ["agent_timeout_seconds", "Agent call timeout (seconds)", "int"], ["default_max_turns", "Default turns per agent call", "int"],
@@ -30,10 +37,112 @@ const WORKFLOW_FIELDS = [
   ["max_stage_errors", "Agent errors per stage before blocking", "int"],
 ];
 
+// A saved value that is not in the list (edited by hand in the JSON file) stays visible and selected.
+function Select({ value, options, onChange, ...props }) {
+  const current = value ?? "";
+  const known = options.some(([v]) => v === current);
+  return (
+    <select {...props} value={current} onChange={(e) => onChange(e.target.value)}>
+      {!known && <option value={current}>{current || "(not set)"}</option>}
+      {options.map(([v, t]) => <option key={v} value={v}>{t}</option>)}
+    </select>
+  );
+}
+
+const SPECIAL_NAMES = { qa: "QA", devops: "DevOps" };
+const agentLabel = (name) => name.split("_").map((w) => SPECIAL_NAMES[w] || w[0].toUpperCase() + w.slice(1)).join(" ");
+
+const TEAM_MODES = [
+  ["full", "Full team - every agent runs"],
+  ["custom", "Custom team - I choose the agents"],
+  ["auto", "Automatic - sized to each task"],
+];
+const TEAM_HINTS = {
+  full: "All 9 agents work on every task. The most thorough option, and the one that uses the most Claude usage.",
+  custom: "Tick the agents this project needs. The Product Manager, Developer, Code Reviewer and Product Validator always run.",
+  auto: "Each task gets the agents it needs, judged from its size and kind. Simple, documentation and test tasks skip the Architect and QA Engineer, " +
+    "and skip the Security Auditor unless they touch security-sensitive code. Review and validation always run. " +
+    "The team picked for a task is shown in the Console when the task starts.",
+};
+
+function AgentTeam({ roles, mode, agents, onChange }) {
+  const chosen = agents || [];
+  const optional = roles.filter((r) => !r.required).map((r) => r.name);
+  function setMode(value) {
+    onChange("agent_team.mode", value);
+    if (value === "custom" && chosen.length === 0) onChange("agent_team.agents", optional);
+  }
+  function toggle(name, on) {
+    onChange("agent_team.agents", optional.filter((a) => (a === name ? on : chosen.includes(a))));
+  }
+  return (
+    <div>
+      <div className="form-grid"><label>Agent team<Select value={mode} options={TEAM_MODES} onChange={setMode} /></label></div>
+      <p className="hint">{TEAM_HINTS[mode]}</p>
+      {mode === "custom" && (
+        <div className="agent-list">
+          {roles.map((r) => (
+            <label key={r.name} className="agent-choice">
+              <input type="checkbox" checked={r.required || chosen.includes(r.name)} disabled={r.required} onChange={(e) => toggle(r.name, e.target.checked)} />
+              <span><strong>{agentLabel(r.name)}</strong><br /><span className="hint">{r.role}</span></span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentModels({ options, values, onChange, disabled }) {
+  const modelLabel = (id) => options.models.find((m) => m.id === id)?.label || id || "SDK default";
+  const models = [["", `Default (${modelLabel(values.model)})`], ...options.models.map((m) => [m.id, m.label])];
+  const efforts = [["", `Default (${values.default_effort})`], ...options.efforts.map((e) => [e, e])];
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr><th>Agent</th><th>Claude model</th><th>Effort level</th></tr></thead>
+        <tbody>
+          {options.agents.map((agent) => {
+            const name = agentLabel(agent);
+            return (
+              <tr key={agent}>
+                <th>{name}</th>
+                <td><Select aria-label={`${name} model`} disabled={disabled} value={values[`agents.${agent}.model`]} options={models} onChange={(v) => onChange(`agents.${agent}.model`, v)} /></td>
+                <td><Select aria-label={`${name} effort level`} disabled={disabled} value={values[`agents.${agent}.effort`]} options={efforts} onChange={(v) => onChange(`agents.${agent}.effort`, v)} /></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AutomaticModels({ options, values, onChange }) {
+  const limits = options.upgrade_limits.map((m) => [m.id, m.label]);
+  return (
+    <>
+      <div className="form-grid">
+        <Field spec={["auto_model_selection", "Automatic model and effort selection (from each task's complexity)", "bool"]} value={values.auto_model_selection} onChange={onChange} />
+        <Field spec={["auto_escalation", "Automatic upgrade on failure (retry with a stronger model and higher effort)", "bool"]} value={values.auto_escalation} onChange={onChange} />
+        {values.auto_escalation && <Field spec={["escalation_max_model", "Highest model for upgrades", "select", limits]} value={values.escalation_max_model} onChange={onChange} />}
+      </div>
+      {values.auto_model_selection && (
+        <p className="hint">Simple tasks use Claude Sonnet 5.5 at medium effort, standard tasks Claude Opus 5.5 at high, and complex tasks Claude Opus 5.5 at xhigh.
+          The QA Engineer and DevOps Engineer run one effort level lower. While this is on, the per-agent choices below are kept but not used.</p>
+      )}
+      {values.auto_escalation && (
+        <p className="hint">After each failed attempt (an agent error, invalid output, or work sent back by review, tests, scans or validation), that agent's next try
+          goes one step up: higher effort first, then a stronger model, up to the highest model you choose, then max effort. Upgrades cost more per call; the budget limits still apply.</p>
+      )}
+    </>
+  );
+}
+
 function Field({ spec, value, onChange }) {
   const [key, label, type, options] = spec;
   if (type === "bool") return <label className="check"><input type="checkbox" checked={!!value} onChange={(e) => onChange(key, e.target.checked)} /> {label}</label>;
-  if (type === "select") return <label>{label}<select value={value ?? ""} onChange={(e) => onChange(key, e.target.value)}>{options.map(([v, t]) => <option key={v} value={v}>{t}</option>)}</select></label>;
+  if (type === "select") return <label>{label}<Select value={value} options={options} onChange={(v) => onChange(key, v)} /></label>;
   if (type === "textarea") return <label className="block">{label}<textarea className="big" rows={8} value={value ?? ""} onChange={(e) => onChange(key, e.target.value)} /></label>;
   if (type === "list") return <label>{label}<input value={(value || []).join(", ")} onChange={(e) => onChange(key, e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} /></label>;
   const numeric = type === "int" || type === "float";
@@ -80,20 +189,31 @@ export default function Settings({ project, projects }) {
   if (!project) return <p className="empty">Select a project first.</p>;
   if (!data) return <ErrorBox error={error} />;
   const dirty = Object.keys(changed("project")).length + Object.keys(changed("workflow")).length;
+  const saveButton = <button onClick={save} disabled={!dirty}>Save {dirty ? `(${dirty} change${dirty > 1 ? "s" : ""})` : ""}</button>;
+  const setWorkflow = (k, v) => setDraft((d) => ({ ...d, workflow: { ...d.workflow, [k]: v } }));
+  const setProject = (k, v) => setDraft((d) => ({ ...d, project: { ...d.project, [k]: v } }));
   return (
     <div>
       {message && <div className="notice">{message}</div>}
       <ErrorBox error={error} />
       {selected && selected.controller.running && <div className="notice">The controller is running. Stop it before saving settings.</div>}
-      <Section title={`Project settings: ${data.read_only.project_name}`} actions={<button onClick={save} disabled={!dirty}>Save {dirty ? `(${dirty} change${dirty > 1 ? "s" : ""})` : ""}</button>}>
+      <Section title={`Project settings: ${data.read_only.project_name}`} actions={saveButton}>
         <div className="form-grid">
-          {PROJECT_FIELDS.map((spec) => <Field key={spec[0]} spec={spec} value={draft.project[spec[0]]} onChange={(k, v) => setDraft({ ...draft, project: { ...draft.project, [k]: v } })} />)}
+          {PROJECT_FIELDS.map((spec) => <Field key={spec[0]} spec={spec} value={draft.project[spec[0]]} onChange={setProject} />)}
         </div>
+      </Section>
+      <Section title={`Agent team: ${data.read_only.project_name}`} actions={saveButton}>
+        <AgentTeam roles={data.options.agent_roles} mode={draft.project["agent_team.mode"]} agents={draft.project["agent_team.agents"]} onChange={setProject} />
       </Section>
       <Section title="Global settings (all projects)">
         <div className="form-grid">
-          {WORKFLOW_FIELDS.map((spec) => <Field key={spec[0]} spec={spec} value={draft.workflow[spec[0]]} onChange={(k, v) => setDraft({ ...draft, workflow: { ...draft.workflow, [k]: v } })} />)}
+          {[...modelFields(data.options), ...WORKFLOW_FIELDS].map((spec) => <Field key={spec[0]} spec={spec} value={draft.workflow[spec[0]]} onChange={setWorkflow} />)}
         </div>
+      </Section>
+      <Section title="Agent models and effort (all projects)" actions={saveButton}>
+        <AutomaticModels options={data.options} values={draft.workflow} onChange={setWorkflow} />
+        {!draft.workflow.auto_model_selection && <p className="hint">Choose a model and effort level for each agent. "Default" follows the default model and default effort in Global settings.</p>}
+        <AgentModels options={data.options} values={draft.workflow} onChange={setWorkflow} disabled={!!draft.workflow.auto_model_selection} />
       </Section>
       <Section title="Fixed safety settings (not editable here)">
         <table><tbody>{Object.entries(data.read_only).map(([k, v]) => <tr key={k}><th>{k}</th><td>{String(v)}</td></tr>)}</tbody></table>

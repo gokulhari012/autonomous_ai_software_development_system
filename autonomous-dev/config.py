@@ -91,6 +91,26 @@ class PySideAppConfig(BaseModel):
     executable_path: str | None = None
 
 
+# Agents that run for every task. Code review and product validation are mandatory safety gates.
+CORE_AGENTS = ("product_manager", "developer", "code_reviewer", "product_validator")
+# Agents a project may leave out of its agent team (see agent_selection.py for what replaces each one).
+OPTIONAL_AGENTS = ("architect", "qa_engineer", "security_auditor", "bug_fixer", "devops_engineer")
+
+
+class AgentTeamConfig(BaseModel):
+    # full = every agent; custom = the core agents plus ``agents``; auto = sized for each task.
+    mode: Literal["full", "custom", "auto"] = "full"
+    agents: list[str] = Field(default_factory=lambda: list(OPTIONAL_AGENTS))
+
+    @field_validator("agents")
+    @classmethod
+    def _known_agents(cls, value: list[str]) -> list[str]:
+        unknown = sorted(set(value) - set(OPTIONAL_AGENTS))
+        if unknown:
+            raise ValueError(f"agent_team.agents may only contain {list(OPTIONAL_AGENTS)}; unknown: {unknown}")
+        return [a for a in OPTIONAL_AGENTS if a in value]
+
+
 class ProjectConfig(BaseModel):
     project_name: str
     project_path: str
@@ -127,6 +147,7 @@ class ProjectConfig(BaseModel):
     stop_after: Literal["task", "requirements", "manual"] = "requirements"
     # Wait for the Claude usage limit to reset and continue automatically instead of stopping.
     auto_resume_on_limit: bool = False
+    agent_team: AgentTeamConfig = Field(default_factory=AgentTeamConfig)
     # Free-text project description / instructions given to the Product Manager (any mode).
     project_notes: str = Field("", max_length=20000)
     python_executable: str | None = None
@@ -195,6 +216,12 @@ class WorkflowConfig(BaseModel):
     notification_dedupe_seconds: int = 600
     # OS-level Bash sandboxing offered by Claude Code (macOS/Linux only; ignored on Windows).
     sandbox_bash: bool = True
+    # Pick each agent call's model and effort from the task's complexity (ignores per-agent model/effort).
+    auto_model_selection: bool = False
+    # When an agent fails a task (error, invalid output, or its work is sent back for repair), retry it
+    # one step stronger: higher effort first, then a stronger model, never above escalation_max_model.
+    auto_escalation: bool = False
+    escalation_max_model: Literal["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"] = "claude-opus-5-5"
     agents: dict[str, AgentSettings] = Field(default_factory=dict)
 
     def agent(self, name: str) -> AgentSettings:

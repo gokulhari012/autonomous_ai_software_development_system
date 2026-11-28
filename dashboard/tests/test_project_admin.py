@@ -79,6 +79,60 @@ def test_settings_whitelist_validation_and_rollback(env):
     assert client.put(f"/api/projects/{slug}/settings", json={"project": {"max_tasks_per_run": 8}}).status_code == 403  # CSRF
 
 
+def test_agent_model_and_effort_assignment(env):
+    client, headers, tmp_path, db_path, name, slug = env
+    client.post("/api/control/create_project", headers=headers, json={"name": name, "path": str(tmp_path / "m"), "mode": "new"})
+    url = f"/api/projects/{slug}/settings"
+    workflow_file = CONTROLLER / "config" / "workflow.json"
+    original = workflow_file.read_text(encoding="utf-8")  # shared by all projects, so restore it afterwards
+    try:
+        options = client.get(url).json()["options"]
+        assert "developer" in options["agents"] and any(m["id"] == "claude-sonnet-5-5" for m in options["models"])
+
+        r = client.put(url, headers=headers, json={"workflow": {"agents.developer.model": "claude-sonnet-5-5", "agents.developer.effort": "max"}})
+        assert r.status_code == 200, r.text
+        assert r.json()["workflow"]["agents.developer.model"] == "claude-sonnet-5-5"
+        developer = json.loads(workflow_file.read_text(encoding="utf-8"))["agents"]["developer"]
+        assert developer["model"] == "claude-sonnet-5-5" and developer["effort"] == "max" and developer["max_turns"] == 80
+
+        # "Default" removes the override and leaves the agent's other limits alone
+        r = client.put(url, headers=headers, json={"workflow": {"agents.developer.model": "", "agents.developer.effort": ""}})
+        assert r.status_code == 200 and r.json()["workflow"]["agents.developer.effort"] == "", r.text
+        assert json.loads(workflow_file.read_text(encoding="utf-8"))["agents"]["developer"] == {"max_turns": 80}
+
+        for bad in ({"agents.developer.effort": "extreme"}, {"agents.developer.model": "gpt-x"}, {"agents.developer.max_turns": 5}, {"agents.nobody.model": "claude-opus-5-5"}):
+            assert client.put(url, headers=headers, json={"workflow": bad}).status_code == 400, bad
+    finally:
+        workflow_file.write_text(original, encoding="utf-8")
+
+
+def test_agent_team_and_automatic_model_settings(env):
+    client, headers, tmp_path, db_path, name, slug = env
+    client.post("/api/control/create_project", headers=headers, json={"name": name, "path": str(tmp_path / "team"), "mode": "new"})
+    url = f"/api/projects/{slug}/settings"
+    workflow_file = CONTROLLER / "config" / "workflow.json"
+    original = workflow_file.read_text(encoding="utf-8")
+    try:
+        data = client.get(url).json()
+        assert data["project"]["agent_team.mode"] == "full" and "architect" in data["project"]["agent_team.agents"]
+        roles = {r["name"]: r for r in data["options"]["agent_roles"]}
+        assert roles["code_reviewer"]["required"] and not roles["qa_engineer"]["required"]
+        assert data["workflow"]["auto_model_selection"] is False and data["workflow"]["escalation_max_model"] == "claude-opus-5-5"
+
+        r = client.put(url, headers=headers, json={"project": {"agent_team.mode": "custom", "agent_team.agents": ["qa_engineer", "architect"]},
+                                                    "workflow": {"auto_model_selection": True, "auto_escalation": True, "escalation_max_model": "claude-fable-5-2"}})
+        assert r.status_code == 200, r.text
+        config = json.loads((CONTROLLER / "config" / "projects" / f"{slug}.json").read_text(encoding="utf-8"))
+        assert config["agent_team"] == {"mode": "custom", "agents": ["architect", "qa_engineer"]}
+        assert json.loads(workflow_file.read_text(encoding="utf-8"))["escalation_max_model"] == "claude-fable-5-2"
+
+        for bad in ({"project": {"agent_team.agents": ["developer"]}}, {"project": {"agent_team.mode": "some"}},
+                    {"workflow": {"escalation_max_model": "claude-haiku-5-5"}}, {"workflow": {"auto_escalation": "yes"}}):
+            assert client.put(url, headers=headers, json=bad).status_code == 400, bad
+    finally:
+        workflow_file.write_text(original, encoding="utf-8")
+
+
 def test_existing_project_description_becomes_notes(env):
     client, headers, tmp_path, db_path, name, slug = env
     existing = tmp_path / "existing"

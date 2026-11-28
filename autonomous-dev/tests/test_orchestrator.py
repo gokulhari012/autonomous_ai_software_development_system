@@ -434,6 +434,48 @@ def test_retry_limit_blocks_task_and_other_tasks_continue(tmp_path):
     assert orch.state.get_requirement(stats["requirement_id"])["status"] != "COMPLETED"
 
 
+def test_custom_team_skips_agents_and_failed_developer_is_upgraded(tmp_path):
+    """Custom team with only the core agents: no design step, the Developer fixes review findings itself,
+    and every attempt it gets sent back runs one step stronger (automatic upgrade on failure)."""
+    from config import AgentSettings
+
+    project = copy_sample("flask-inventory", tmp_path)
+    used: list[tuple[str | None, str | None]] = []
+    prompts: list[str] = []
+
+    def developer(call):
+        used.append((call.ctx.model, call.ctx.effort))
+        prompts.append(call.prompt)
+        call.write_file("inventory/stats.py", f"VALUE = {len(used)}\n")
+        return {"status": "PASS", "summary": "done"}
+
+    def reviewer(call):
+        return {"status": "FAIL", "summary": "wrong", "findings": [{"title": "Logic error", "severity": "HIGH", "file_path": "inventory/stats.py", "line_number": 1, "explanation": "always constant", "recommendation": "compute it"}]}
+
+    handlers = {"product_manager": lambda call: _pm_output(False), "developer": developer, "code_reviewer": reviewer}
+    orch, backend, _ = _orchestrator(tmp_path, project, handlers, agent_team={"mode": "custom", "agents": []})
+    orch.config.workflow.auto_escalation = True
+    orch.config.workflow.auto_model_selection = False
+    orch.config.workflow.escalation_max_model = "claude-opus-5-5"
+    orch.config.workflow.agents = {"developer": AgentSettings(model="claude-sonnet-5-5", effort="medium")}
+    asyncio.run(orch.run())
+
+    task = orch.state.list_tasks(orch.pid)[0]
+    assert task["status"] == "BLOCKED" and "maximum repair attempts (3)" in task["blocked_reason"]
+    called = [c[0] for c in backend.calls]
+    assert "architect" not in called and "bug_fixer" not in called  # not on the team; never invoked
+    assert called.count("developer") == 4 and called.count("code_reviewer") == 4
+    assert used == [("claude-sonnet-5-5", "medium"), ("claude-sonnet-5-5", "high"), ("claude-opus-5-5", "high"), ("claude-opus-5-5", "xhigh")]
+    assert "Logic error" not in prompts[0] and all("Logic error" in p and "compute it" in p for p in prompts[1:])  # developer got the review findings
+    history = [h["to_stage"] for h in orch.state.task_history(task["id"])]
+    assert "BUG_FIXING" in history and history[history.index("BUG_FIXING") + 1] == "DEVELOPMENT"
+    events = orch.state.events_after(0, 5000, orch.pid)
+    team = [e for e in events if e["event_type"] == "AGENT_TEAM_SELECTED"]
+    assert team and "without architect" in team[0]["summary"].lower()
+    started = [e["summary"] for e in events if e["event_type"] == "AGENT_STARTED" and e["agent_name"] == "developer"]
+    assert "upgraded from claude-sonnet-5-5 / medium after 1 failed attempt(s)" in started[1]
+
+
 def test_illegal_transition_is_rejected(tmp_path):
     project = copy_sample("flask-inventory", tmp_path)
     orch, _, _ = _orchestrator(tmp_path, project, {})
